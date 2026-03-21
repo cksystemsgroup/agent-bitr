@@ -9,9 +9,24 @@ use std::collections::HashMap;
 use bvdd::types::{BvcId, BvWidth, OpKind};
 use bvdd::term::TermTable;
 use bvdd::constraint::ConstraintTable;
-use bvdd::bvc::BvcManager;
+use bvdd::bvc::{BvcManager, BvcEntry};
 
 use crate::btor2::{Btor2Model, Btor2Sort};
+
+/// Tracks array state for ROW expansion
+#[derive(Clone, Debug)]
+enum ArrayState {
+    /// Base array (unconstrained input)
+    Base { nid: u32, index_width: BvWidth, element_width: BvWidth },
+    /// Write: store(base, addr, val)
+    Write {
+        base: Box<ArrayState>,
+        addr_bvc: BvcId,
+        val_bvc: BvcId,
+        index_width: BvWidth,
+        element_width: BvWidth,
+    },
+}
 
 /// Result of lifting a BTOR2 model
 pub struct LiftedModel {
@@ -76,6 +91,7 @@ pub fn lift_btor2(model: &Btor2Model) -> Result<LiftedModel, String> {
     let mut ct = ConstraintTable::new();
     let mut bm = BvcManager::new();
     let mut nid_to_bvc: HashMap<u32, BvcId> = HashMap::new();
+    let mut nid_to_array: HashMap<u32, ArrayState> = HashMap::new();
     let mut sort_map: HashMap<u32, Btor2Sort> = HashMap::new();
     let mut bad_properties = Vec::new();
     let mut states: Vec<(u32, Option<BvcId>, Option<BvcId>)> = Vec::new();
@@ -90,8 +106,18 @@ pub fn lift_btor2(model: &Btor2Model) -> Result<LiftedModel, String> {
     let get_width = |sort_id: u32| -> Result<BvWidth, String> {
         match sort_map.get(&sort_id) {
             Some(Btor2Sort::Bitvec(w)) => Ok(*w),
-            Some(Btor2Sort::Array { .. }) => Err("array sort not yet supported in lifter".into()),
+            Some(Btor2Sort::Array { element_width, .. }) => Ok(*element_width),
             None => Err(format!("unknown sort id {}", sort_id)),
+        }
+    };
+
+    // Helper: get array sort info
+    let get_array_sort = |sort_id: u32| -> Option<(BvWidth, BvWidth)> {
+        match sort_map.get(&sort_id) {
+            Some(Btor2Sort::Array { index_width, element_width }) => {
+                Some((*index_width, *element_width))
+            }
+            _ => None,
         }
     };
 
@@ -101,15 +127,34 @@ pub fn lift_btor2(model: &Btor2Model) -> Result<LiftedModel, String> {
 
         match op {
             "input" => {
-                let width = get_width(node.sort_id)?;
-                let bvc = bm.make_input(&mut tt, &ct, node.nid, width);
-                nid_to_bvc.insert(node.nid, bvc);
+                if let Some((iw, ew)) = get_array_sort(node.sort_id) {
+                    // Array input: track as base array state
+                    nid_to_array.insert(node.nid, ArrayState::Base {
+                        nid: node.nid,
+                        index_width: iw,
+                        element_width: ew,
+                    });
+                } else {
+                    let width = get_width(node.sort_id)?;
+                    let bvc = bm.make_input(&mut tt, &ct, node.nid, width);
+                    nid_to_bvc.insert(node.nid, bvc);
+                }
             }
             "state" => {
-                let width = get_width(node.sort_id)?;
-                let bvc = bm.make_input(&mut tt, &ct, node.nid, width);
-                nid_to_bvc.insert(node.nid, bvc);
-                states.push((node.nid, None, None));
+                if let Some((iw, ew)) = get_array_sort(node.sort_id) {
+                    // Array state
+                    nid_to_array.insert(node.nid, ArrayState::Base {
+                        nid: node.nid,
+                        index_width: iw,
+                        element_width: ew,
+                    });
+                    states.push((node.nid, None, None));
+                } else {
+                    let width = get_width(node.sort_id)?;
+                    let bvc = bm.make_input(&mut tt, &ct, node.nid, width);
+                    nid_to_bvc.insert(node.nid, bvc);
+                    states.push((node.nid, None, None));
+                }
             }
             "init" => {
                 if node.args.len() >= 2 {
@@ -174,6 +219,52 @@ pub fn lift_btor2(model: &Btor2Model) -> Result<LiftedModel, String> {
                 let bvc = bm.make_const(&mut tt, &ct, 0, width);
                 nid_to_bvc.insert(node.nid, bvc);
             }
+            // Array WRITE: track the write chain
+            "write" => {
+                if node.args.len() >= 3 {
+                    let array_nid = node.args[0].unsigned_abs() as u32;
+                    let addr_bvc = resolve_ref(&nid_to_bvc, &mut bm, &mut tt, &mut ct, node.args[1])?;
+                    let val_bvc = resolve_ref(&nid_to_bvc, &mut bm, &mut tt, &mut ct, node.args[2])?;
+
+                    let base_state = nid_to_array.get(&array_nid)
+                        .ok_or_else(|| format!("write to non-array nid {}", array_nid))?
+                        .clone();
+
+                    let (iw, ew) = match &base_state {
+                        ArrayState::Base { index_width, element_width, .. } => (*index_width, *element_width),
+                        ArrayState::Write { index_width, element_width, .. } => (*index_width, *element_width),
+                    };
+
+                    nid_to_array.insert(node.nid, ArrayState::Write {
+                        base: Box::new(base_state),
+                        addr_bvc,
+                        val_bvc,
+                        index_width: iw,
+                        element_width: ew,
+                    });
+                }
+            }
+            // Array READ: expand to ITE chain (ROW expansion)
+            "read" => {
+                if node.args.len() >= 2 {
+                    let array_nid = node.args[0].unsigned_abs() as u32;
+                    let read_addr_bvc = resolve_ref(&nid_to_bvc, &mut bm, &mut tt, &mut ct, node.args[1])?;
+                    let width = get_width(node.sort_id)?;
+
+                    if let Some(array_state) = nid_to_array.get(&array_nid).cloned() {
+                        // Expand READ-over-WRITE chain to ITE chain
+                        let result_bvc = expand_read(
+                            &mut tt, &mut ct, &mut bm,
+                            &array_state, read_addr_bvc, width,
+                        );
+                        nid_to_bvc.insert(node.nid, result_bvc);
+                    } else {
+                        // Read from non-array? Treat as unconstrained
+                        let bvc = bm.make_input(&mut tt, &ct, node.nid, width);
+                        nid_to_bvc.insert(node.nid, bvc);
+                    }
+                }
+            }
             // Slice: special handling for bit indices
             "slice" => {
                 let width = get_width(node.sort_id)?;
@@ -184,7 +275,6 @@ pub fn lift_btor2(model: &Btor2Model) -> Result<LiftedModel, String> {
                 let arg_term = bm.get(operand).entries[0].term;
                 let slice_term = tt.make_slice(arg_term, upper, lower);
                 let constraint = bm.get(operand).entries[0].constraint;
-                use bvdd::bvc::BvcEntry;
                 let bvc = bm.alloc(width, vec![BvcEntry {
                     term: slice_term,
                     constraint,
@@ -199,7 +289,6 @@ pub fn lift_btor2(model: &Btor2Model) -> Result<LiftedModel, String> {
                 let arg_term = bm.get(operand).entries[0].term;
                 let ext_term = tt.make_app(op_kind, vec![arg_term], width);
                 let constraint = bm.get(operand).entries[0].constraint;
-                use bvdd::bvc::BvcEntry;
                 let bvc = bm.alloc(width, vec![BvcEntry {
                     term: ext_term,
                     constraint,
@@ -249,6 +338,78 @@ pub fn lift_btor2(model: &Btor2Model) -> Result<LiftedModel, String> {
         states,
         constraints,
     })
+}
+
+/// Expand a READ from an array state into an ITE chain.
+///
+/// READ(WRITE(a, w_addr, w_val), r_addr) →
+///   ITE(EQ(r_addr, w_addr), w_val, READ(a, r_addr))
+///
+/// Nested writes produce nested ITE chains.
+fn expand_read(
+    tt: &mut TermTable,
+    ct: &mut ConstraintTable,
+    bm: &mut BvcManager,
+    state: &ArrayState,
+    read_addr_bvc: BvcId,
+    element_width: BvWidth,
+) -> BvcId {
+    match state {
+        ArrayState::Base { nid, index_width, .. } => {
+            // Base array: READ is unconstrained — model as a fresh variable
+            // (any array read from an unconstrained base is unconstrained)
+            let read_addr_term = bm.get(read_addr_bvc).entries[0].term;
+            let array_var = tt.make_var(*nid, *index_width);
+            let read_term = tt.make_app(
+                OpKind::Read,
+                vec![array_var, read_addr_term],
+                element_width,
+            );
+            bm.alloc(element_width, vec![BvcEntry {
+                term: read_term,
+                constraint: ct.true_id(),
+            }])
+        }
+        ArrayState::Write { base, addr_bvc, val_bvc, index_width: _, element_width: ew } => {
+            // ROW expansion:
+            // ITE(EQ(r_addr, w_addr), w_val, READ(base, r_addr))
+            let r_addr_term = bm.get(read_addr_bvc).entries[0].term;
+            let w_addr_term = bm.get(*addr_bvc).entries[0].term;
+            let w_val_term = bm.get(*val_bvc).entries[0].term;
+
+            // Build EQ(r_addr, w_addr)
+            let addr_width = tt.get(r_addr_term).width;
+            let eq_term = tt.make_app(OpKind::Eq, vec![r_addr_term, w_addr_term], 1);
+
+            // Recursively expand READ from the base array
+            let base_read_bvc = expand_read(tt, ct, bm, base, read_addr_bvc, *ew);
+            let base_read_term = bm.get(base_read_bvc).entries[0].term;
+
+            // Build ITE(eq, w_val, base_read)
+            let ite_term = tt.make_app(
+                OpKind::Ite,
+                vec![eq_term, w_val_term, base_read_term],
+                element_width,
+            );
+
+            // Collect constraints from all involved BVCs
+            let mut constraint = ct.true_id();
+            let r_constraint = bm.get(read_addr_bvc).entries[0].constraint;
+            let w_addr_constraint = bm.get(*addr_bvc).entries[0].constraint;
+            let w_val_constraint = bm.get(*val_bvc).entries[0].constraint;
+            let base_constraint = bm.get(base_read_bvc).entries[0].constraint;
+            constraint = ct.make_and(constraint, r_constraint);
+            constraint = ct.make_and(constraint, w_addr_constraint);
+            constraint = ct.make_and(constraint, w_val_constraint);
+            constraint = ct.make_and(constraint, base_constraint);
+            let _ = addr_width;
+
+            bm.alloc(element_width, vec![BvcEntry {
+                term: ite_term,
+                constraint,
+            }])
+        }
+    }
 }
 
 /// Resolve a BTOR2 reference (possibly negated) to a BvcId

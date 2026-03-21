@@ -4,9 +4,10 @@
 //! See `.claude/commands/bitr-expert.md` Sections 3-4.
 
 use std::collections::HashMap;
-use crate::types::{BvddId, BvcId, ConstraintId, SolveResult};
+use crate::types::{BvddId, BvcId, ConstraintId, SolveResult, OpKind};
 use crate::valueset::ValueSet;
-use crate::term::TermTable;
+use crate::term::{TermTable, TermKind};
+use crate::eval::CompiledProgram;
 use crate::constraint::{ConstraintTable, ConstraintKind};
 use crate::bvc::BvcManager;
 use crate::bvdd::{BvddManager, BvddNodeKind, BvddEdge};
@@ -28,6 +29,13 @@ pub struct SolverContext<'a> {
     pub restrict_calls: u64,
     pub sat_witnesses: u64,
     pub unsat_terminals: u64,
+    pub bool_decomp_calls: u64,
+    pub compiled_blast_calls: u64,
+    pub byte_blast_calls: u64,
+    pub oracle_calls: u64,
+    /// Oracle function: term→SMT-LIB2, invoke external solver
+    #[allow(clippy::type_complexity)]
+    pub oracle_fn: Option<Box<dyn FnMut(&TermTable, crate::types::TermId, u16, ValueSet) -> SolveResult + 'a>>,
 }
 
 impl<'a> SolverContext<'a> {
@@ -50,7 +58,17 @@ impl<'a> SolverContext<'a> {
             restrict_calls: 0,
             sat_witnesses: 0,
             unsat_terminals: 0,
+            bool_decomp_calls: 0,
+            compiled_blast_calls: 0,
+            byte_blast_calls: 0,
+            oracle_calls: 0,
+            oracle_fn: None,
         }
+    }
+
+    /// Set an external oracle function
+    pub fn set_oracle(&mut self, f: impl FnMut(&TermTable, crate::types::TermId, u16, ValueSet) -> SolveResult + 'a) {
+        self.oracle_fn = Some(Box::new(f));
     }
 
     /// Solve(G, S): traverse BVDD G restricted to value set S
@@ -67,8 +85,8 @@ impl<'a> SolverContext<'a> {
             // For ground terminals, verify the value is in the target set
             if let BvddNodeKind::Terminal { bvc } = self.mgr.get(g).kind {
                 if let Some(val) = self.bm.get_const_value(self.tt, bvc) {
-                    let check_val = val & 0xFF;
-                    if s.contains(check_val as u8) {
+                    let check_val = (val & 0xFF) as u8;
+                    if s.contains(check_val) {
                         return g; // Ground and satisfies target
                     } else {
                         return self.mgr.false_terminal(); // Ground but doesn't satisfy target
@@ -272,7 +290,11 @@ impl<'a> SolverContext<'a> {
         }])
     }
 
-    /// Theory resolution: when no predicates remain, evaluate terms directly
+    /// Theory resolution cascade (4 stages):
+    /// 1. Boolean decomposition (1-bit comparison subterms)
+    /// 2. Generalized blast (compiled evaluator, budget 2^28)
+    /// 3. Byte-blast oracle (split widest var MSB, max_depth=4)
+    /// 4. Direct theory oracle (external solver)
     fn theory_resolve(&mut self, bvc: BvcId, s: ValueSet) -> BvddId {
         let entry = &self.bm.get(bvc).entries[0];
         let term = entry.term;
@@ -282,37 +304,206 @@ impl<'a> SolverContext<'a> {
         let vars = self.tt.collect_vars(term);
 
         if vars.is_empty() {
-            // No variables — evaluate the constant
-            let assign = HashMap::new();
-            if let Some(val) = self.tt.eval(term, &assign) {
-                let check_val = if width <= 8 {
-                    val & ((1u64 << width) - 1)
-                } else {
-                    val & 0xFF
-                };
-                if s.contains(check_val as u8) {
-                    let const_bvc = self.bm.make_const(self.tt, self.ct, val, width);
-                    self.sat_witnesses += 1;
-                    return self.mgr.make_terminal(const_bvc, true, true);
-                }
-            }
-            self.unsat_terminals += 1;
-            return self.mgr.false_terminal();
+            return self.theory_resolve_ground(bvc, s);
         }
 
-        // Generalized blast: enumerate narrowest variable first
-        self.generalized_blast(bvc, s, &vars)
+        // Stage 1: Boolean decomposition for 1-bit comparison subterms
+        if width == 1 {
+            if let Some(result) = self.boolean_decompose(bvc, s, &vars) {
+                return result;
+            }
+        }
+
+        // Compute total domain product for budget check
+        let total_domain: u128 = vars.iter()
+            .map(|&(_, w)| if w >= 64 { u128::MAX } else { 1u128 << w })
+            .fold(1u128, |acc, d| acc.saturating_mul(d));
+
+        // Stage 2: Generalized blast with compiled evaluator
+        if total_domain <= (1u128 << 28) {
+            return self.compiled_blast(bvc, s, &vars);
+        }
+
+        // Stage 3: Byte-blast oracle (split widest var's MSB byte)
+        if let Some(result) = self.byte_blast(bvc, s, &vars, 0) {
+            return result;
+        }
+
+        // Stage 4: Direct theory oracle
+        self.invoke_oracle(bvc, s)
     }
 
-    /// Generalized blast: enumerate values of the narrowest variable
-    fn generalized_blast(
+    /// Stage 1: Boolean decomposition — find comparison subterms in 1-bit
+    /// expressions, branch on true/false for each.
+    fn boolean_decompose(
+        &mut self,
+        bvc: BvcId,
+        s: ValueSet,
+        vars: &[(u32, u16)],
+    ) -> Option<BvddId> {
+        let term = self.bm.get(bvc).entries[0].term;
+        let width = self.bm.get(bvc).width;
+
+        // Find a comparison subterm to decompose on
+        let comp = self.find_comparison_subterm(term);
+        let comp = match comp {
+            Some(c) => c,
+            None => return None,
+        };
+
+        self.bool_decomp_calls += 1;
+
+        // Branch: assume comparison = true (1), then comparison = false (0)
+        let constraint = self.bm.get(bvc).entries[0].constraint;
+        let mut result_edges = Vec::new();
+
+        for branch_val in [1u64, 0u64] {
+            let new_term = self.tt.subst_and_fold(term, comp, branch_val);
+
+            // Check if it collapsed to a constant
+            if let TermKind::Const(val) = self.tt.get(new_term).kind {
+                let check_val = mask_for_check(val, width);
+                if s.contains(check_val) {
+                    let const_bvc = self.bm.make_const(self.tt, self.ct, val, width);
+                    self.sat_witnesses += 1;
+                    return Some(self.mgr.make_terminal(const_bvc, true, true));
+                }
+                continue;
+            }
+
+            // Still has variables — recurse
+            let new_bvc = {
+                use crate::bvc::BvcEntry;
+                self.bm.alloc(width, vec![BvcEntry { term: new_term, constraint }])
+            };
+            let new_vars = self.tt.collect_vars(new_term);
+            let result = if new_vars.is_empty() {
+                self.theory_resolve_ground(new_bvc, s)
+            } else if new_vars.len() < vars.len() {
+                self.theory_resolve(new_bvc, s)
+            } else {
+                // No progress — fall through to blast
+                return None;
+            };
+
+            if self.mgr.get(result).can_be_true && self.mgr.get(result).is_ground {
+                return Some(result); // Early SAT
+            }
+            if !self.mgr.is_false(result) {
+                result_edges.push(BvddEdge {
+                    label: ValueSet::singleton(branch_val as u8),
+                    child: result,
+                });
+            }
+        }
+
+        if result_edges.is_empty() {
+            Some(self.mgr.false_terminal())
+        } else {
+            // Label with the comparison subterm variable
+            let comp_bvc = {
+                use crate::bvc::BvcEntry;
+                let comp_term = self.tt.make_var(comp, 1);
+                self.bm.alloc(1, vec![BvcEntry {
+                    term: comp_term,
+                    constraint: self.ct.true_id(),
+                }])
+            };
+            let label = self.mgr.make_terminal(comp_bvc, true, false);
+            Some(self.mgr.make_decision(label, result_edges))
+        }
+    }
+
+    /// Find a comparison subterm (EQ, ULT, etc.) that can be decomposed.
+    /// Returns a pseudo-variable ID representing the comparison.
+    fn find_comparison_subterm(&mut self, term: crate::types::TermId) -> Option<u32> {
+        match &self.tt.get(term).kind.clone() {
+            TermKind::Const(_) | TermKind::Var(_) => None,
+            TermKind::App { op, args, .. } => {
+                // If this IS a comparison, it can be decomposed
+                if matches!(op,
+                    OpKind::Eq | OpKind::Neq | OpKind::Ult | OpKind::Slt |
+                    OpKind::Ulte | OpKind::Slte | OpKind::Uaddo | OpKind::Umulo
+                ) && self.tt.get(term).width == 1 {
+                    // Create a pseudo-variable for this comparison
+                    let var_id = self.bm.fresh_var();
+                    return Some(var_id);
+                }
+                // Recurse into args to find nested comparisons
+                for &arg in args {
+                    if self.tt.get(arg).width == 1 {
+                        if let Some(v) = self.find_comparison_subterm(arg) {
+                            return Some(v);
+                        }
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Stage 2: Generalized blast with compiled evaluator for fast enumeration.
+    /// Budget: 2^28 total domain product.
+    fn compiled_blast(
         &mut self,
         bvc: BvcId,
         s: ValueSet,
         vars: &[(u32, u16)],
     ) -> BvddId {
+        self.compiled_blast_calls += 1;
+
+        let entry = &self.bm.get(bvc).entries[0];
+        let term = entry.term;
+        let constraint = entry.constraint;
+        let width = self.bm.get(bvc).width;
+
+        // If only one variable remains with small domain, use compiled evaluator
+        let prog = CompiledProgram::compile(self.tt, term);
+
+        if vars.len() == 1 {
+            let (var_id, var_width) = vars[0];
+            let domain_size: u64 = if var_width >= 64 { u64::MAX } else { 1u64 << var_width };
+            if domain_size > (1 << 28) {
+                return self.mgr.make_terminal(bvc, true, false);
+            }
+
+            if let Some(slot_idx) = prog.var_slot(var_id) {
+                let mut slot_vars = vec![0u64; prog.num_vars as usize];
+                for d in 0..domain_size {
+                    slot_vars[slot_idx as usize] = d;
+                    let val = prog.eval(&slot_vars);
+                    let check_val = mask_for_check(val, width);
+                    if s.contains(check_val) {
+                        let const_bvc = self.bm.make_const(self.tt, self.ct, val, width);
+                        self.sat_witnesses += 1;
+                        return self.mgr.make_terminal(const_bvc, true, true);
+                    }
+                }
+                return self.mgr.false_terminal();
+            }
+        }
+
+        // Multi-variable: enumerate narrowest first using SubstAndFold
+        self.generalized_blast_recursive(bvc, s, vars, constraint, term, width)
+    }
+
+    /// Recursive generalized blast: enumerate narrowest variable, SubstAndFold, recurse
+    fn generalized_blast_recursive(
+        &mut self,
+        bvc: BvcId,
+        s: ValueSet,
+        vars: &[(u32, u16)],
+        constraint: ConstraintId,
+        term: crate::types::TermId,
+        width: u16,
+    ) -> BvddId {
         if vars.is_empty() {
-            return self.theory_resolve_ground(bvc, s);
+            // Ground — evaluate directly
+            let eval_bvc = {
+                use crate::bvc::BvcEntry;
+                self.bm.alloc(width, vec![BvcEntry { term, constraint }])
+            };
+            return self.theory_resolve_ground(eval_bvc, s);
         }
 
         // Find narrowest variable
@@ -320,10 +511,8 @@ impl<'a> SolverContext<'a> {
             .min_by_key(|&&(_, w)| w)
             .unwrap();
 
-        // Domain budget check: total domain product must be <= 2^20
         let domain_size: u64 = if var_width >= 64 { u64::MAX } else { 1u64 << var_width };
-        if domain_size > (1 << 20) {
-            // Too large — would need oracle
+        if domain_size > (1 << 28) {
             return self.mgr.make_terminal(bvc, true, false);
         }
 
@@ -332,30 +521,40 @@ impl<'a> SolverContext<'a> {
             .cloned()
             .collect();
 
-        let entry = &self.bm.get(bvc).entries[0];
-        let term = entry.term;
-        let constraint = entry.constraint;
-        let width = self.bm.get(bvc).width;
-
-        // Enumerate all values [0, domain_size-1]
-        let max_val: u64 = domain_size - 1;
         let mut result_edges: Vec<BvddEdge> = Vec::new();
 
-        for d in 0..=max_val {
+        // For single remaining variable with small domain, use compiled evaluator
+        if remaining_vars.is_empty() && domain_size <= 65536 {
+            let prog = CompiledProgram::compile(self.tt, term);
+            if let Some(slot_idx) = prog.var_slot(var_id) {
+                let mut slot_vars = vec![0u64; prog.num_vars as usize];
+                for d in 0..domain_size {
+                    slot_vars[slot_idx as usize] = d;
+                    let val = prog.eval(&slot_vars);
+                    let check_val = mask_for_check(val, width);
+                    if s.contains(check_val) {
+                        let const_bvc = self.bm.make_const(self.tt, self.ct, val, width);
+                        self.sat_witnesses += 1;
+                        return self.mgr.make_terminal(const_bvc, true, true);
+                    }
+                }
+                return self.mgr.false_terminal();
+            }
+        }
+
+        for d in 0..domain_size {
             let new_term = self.tt.subst_and_fold(term, var_id, d);
 
-            let new_bvc = {
-                use crate::bvc::BvcEntry;
-                self.bm.alloc(width, vec![BvcEntry {
-                    term: new_term,
-                    constraint,
-                }])
-            };
-
             let result = if remaining_vars.is_empty() {
+                let new_bvc = {
+                    use crate::bvc::BvcEntry;
+                    self.bm.alloc(width, vec![BvcEntry { term: new_term, constraint }])
+                };
                 self.theory_resolve_ground(new_bvc, s)
             } else {
-                self.generalized_blast(new_bvc, s, &remaining_vars)
+                self.generalized_blast_recursive(
+                    bvc, s, &remaining_vars, constraint, new_term, width,
+                )
             };
 
             if self.mgr.get(result).can_be_true && self.mgr.get(result).is_ground {
@@ -363,19 +562,12 @@ impl<'a> SolverContext<'a> {
             }
 
             if !self.mgr.is_false(result) {
-                // For the BVDD edge label, we need a ValueSet.
-                // For values > 255, we use a placeholder (HSC will handle properly later).
                 let label = if d <= 255 {
                     ValueSet::singleton(d as u8)
                 } else {
-                    // For wide variables, just store a sentinel — the SAT
-                    // path already returns early, and UNSAT keeps going.
                     ValueSet::singleton((d & 0xFF) as u8)
                 };
-                result_edges.push(BvddEdge {
-                    label,
-                    child: result,
-                });
+                result_edges.push(BvddEdge { label, child: result });
             }
         }
 
@@ -395,6 +587,135 @@ impl<'a> SolverContext<'a> {
         }
     }
 
+    /// Stage 3: Byte-blast oracle — split widest variable's MSB byte,
+    /// enumerate 256 values for the MSB, recurse on remainder.
+    /// max_depth=4, adaptive_bailout=25%.
+    fn byte_blast(
+        &mut self,
+        bvc: BvcId,
+        s: ValueSet,
+        vars: &[(u32, u16)],
+        depth: u32,
+    ) -> Option<BvddId> {
+        if depth >= 4 {
+            return None; // Exceeded byte-blast depth
+        }
+
+        // Find widest variable
+        let (var_id, var_width) = *vars.iter()
+            .max_by_key(|&&(_, w)| w)
+            .unwrap();
+
+        if var_width <= 8 {
+            return None; // All variables are <= 8 bits, blast handles this
+        }
+
+        self.byte_blast_calls += 1;
+
+        let entry = &self.bm.get(bvc).entries[0];
+        let term = entry.term;
+        let constraint = entry.constraint;
+        let width = self.bm.get(bvc).width;
+
+        // MSB byte is the top 8 bits; LSB is the rest
+        let msb_bits: u16 = 8.min(var_width);
+        let lsb_bits: u16 = var_width - msb_bits;
+        let lsb_domain: u64 = if lsb_bits >= 64 { u64::MAX } else { 1u64 << lsb_bits };
+
+        // For each MSB byte value, enumerate the LSB range if feasible
+        let mut result_edges: Vec<BvddEdge> = Vec::new();
+        let mut oracle_needed = 0u32;
+
+        for msb in 0..256u64 {
+            let shifted = msb << lsb_bits;
+
+            if lsb_domain <= 256 {
+                // Small LSB: enumerate all combinations
+                for lsb in 0..lsb_domain {
+                    let full_val = shifted | lsb;
+                    let new_term = self.tt.subst_and_fold(term, var_id, full_val);
+                    let remaining: Vec<(u32, u16)> = vars.iter()
+                        .filter(|&&(vid, _)| vid != var_id)
+                        .cloned()
+                        .collect();
+
+                    let new_bvc = {
+                        use crate::bvc::BvcEntry;
+                        self.bm.alloc(width, vec![BvcEntry { term: new_term, constraint }])
+                    };
+
+                    let result = if remaining.is_empty() {
+                        self.theory_resolve_ground(new_bvc, s)
+                    } else {
+                        self.theory_resolve(new_bvc, s)
+                    };
+
+                    if self.mgr.get(result).can_be_true && self.mgr.get(result).is_ground {
+                        return Some(result); // Early SAT
+                    }
+                    if !self.mgr.is_false(result) {
+                        result_edges.push(BvddEdge {
+                            label: ValueSet::singleton(msb as u8),
+                            child: result,
+                        });
+                        break; // Found non-FALSE for this MSB
+                    }
+                }
+            } else {
+                // LSB too wide: would need recursive byte-blast or oracle
+                oracle_needed += 1;
+
+                // Adaptive bailout: if >25% need oracle, stop
+                if oracle_needed * 4 > (msb as u32 + 1) {
+                    return None;
+                }
+            }
+        }
+
+        if result_edges.is_empty() {
+            Some(self.mgr.false_terminal())
+        } else {
+            let var_label_bvc = {
+                use crate::bvc::BvcEntry;
+                let var_label_term = self.tt.make_var(var_id, var_width);
+                self.bm.alloc(var_width, vec![BvcEntry {
+                    term: var_label_term,
+                    constraint: self.ct.true_id(),
+                }])
+            };
+            let label = self.mgr.make_terminal(var_label_bvc, true, false);
+            Some(self.mgr.make_decision(label, result_edges))
+        }
+    }
+
+    /// Stage 4: Invoke external theory oracle on residual formula
+    fn invoke_oracle(&mut self, bvc: BvcId, s: ValueSet) -> BvddId {
+        self.oracle_calls += 1;
+
+        let entry = &self.bm.get(bvc).entries[0];
+        let term = entry.term;
+        let width = self.bm.get(bvc).width;
+
+        if let Some(ref mut oracle_fn) = self.oracle_fn {
+            let result = oracle_fn(self.tt, term, width, s);
+            match result {
+                SolveResult::Sat => {
+                    self.sat_witnesses += 1;
+                    return self.mgr.make_terminal(bvc, true, true);
+                }
+                SolveResult::Unsat => {
+                    self.unsat_terminals += 1;
+                    return self.mgr.false_terminal();
+                }
+                SolveResult::Unknown => {}
+            }
+        }
+
+        // No oracle available or oracle returned Unknown
+        // Return as non-ground (Unknown)
+        self.mgr.make_terminal(bvc, true, false)
+    }
+
     /// Resolve a ground BVC (no variables) against a value set
     fn theory_resolve_ground(&mut self, bvc: BvcId, s: ValueSet) -> BvddId {
         let entry = &self.bm.get(bvc).entries[0];
@@ -403,16 +724,8 @@ impl<'a> SolverContext<'a> {
 
         let assign = HashMap::new();
         if let Some(val) = self.tt.eval(term, &assign) {
-            // For the value-set check, mask to the effective domain.
-            // ValueSet represents 8-bit domain [0, 255].
-            // For width <= 8, the value fits directly.
-            // For width > 8, we check the lower 8 bits (HSC will handle slicing properly later).
-            let check_val = if width <= 8 {
-                val & ((1u64 << width) - 1)
-            } else {
-                val & 0xFF
-            };
-            if s.contains(check_val as u8) {
+            let check_val = mask_for_check(val, width);
+            if s.contains(check_val) {
                 let const_bvc = self.bm.make_const(self.tt, self.ct, val, width);
                 self.sat_witnesses += 1;
                 return self.mgr.make_terminal(const_bvc, true, true);
@@ -431,6 +744,15 @@ impl<'a> SolverContext<'a> {
         } else {
             SolveResult::Unknown
         }
+    }
+}
+
+/// Mask a value for checking against ValueSet (8-bit domain)
+fn mask_for_check(val: u64, width: u16) -> u8 {
+    if width <= 8 {
+        (val & ((1u64 << width) - 1)) as u8
+    } else {
+        (val & 0xFF) as u8
     }
 }
 

@@ -173,24 +173,28 @@ fn solve_combinational(
         let terminal = mgr.make_terminal(bad_bvc, true, is_ground);
         let target = ValueSet::singleton(1);
 
-        let mut ctx = SolverContext::new(
-            &mut lifted.tt,
-            &mut lifted.ct,
-            &mut lifted.bm,
-            &mut mgr,
-        );
-        let result_bvdd = ctx.solve(terminal, target);
-        let result = ctx.get_result(result_bvdd);
+        let (result, solve_calls, canon_calls, decide_calls, sat_w, unsat_t, restrict_c) = {
+            let mut ctx = SolverContext::new(
+                &mut lifted.tt,
+                &mut lifted.ct,
+                &mut lifted.bm,
+                &mut mgr,
+            );
+            let result_bvdd = ctx.solve(terminal, target);
+            let result = ctx.get_result(result_bvdd);
+            (result, ctx.solve_calls, ctx.canonicalize_calls, ctx.decide_calls,
+             ctx.sat_witnesses, ctx.unsat_terminals, ctx.restrict_calls)
+        };
 
         if verbose {
             eprintln!("bitr: bad[{}] = {:?} (solve_calls={}, canonicalize_calls={}, decide_calls={})",
-                i, result, ctx.solve_calls, ctx.canonicalize_calls, ctx.decide_calls);
+                i, result, solve_calls, canon_calls, decide_calls);
         }
 
         if print_stats {
-            eprintln!("  SAT witnesses: {}", ctx.sat_witnesses);
-            eprintln!("  UNSAT terminals: {}", ctx.unsat_terminals);
-            eprintln!("  Restrict calls: {}", ctx.restrict_calls);
+            eprintln!("  SAT witnesses: {}", sat_w);
+            eprintln!("  UNSAT terminals: {}", unsat_t);
+            eprintln!("  Restrict calls: {}", restrict_c);
             eprintln!("  Cache hits/misses: {}/{}", mgr.cache_hits, mgr.cache_misses);
         }
 

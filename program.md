@@ -12,7 +12,7 @@ Build a competitive BTOR2 model checker based on Bitvector Decision Diagrams (BV
 
 ## Current Status
 
-**Phase**: 8 — BMC Loop (complete)
+**Phase**: 9 — Array Support (complete)
 **Last updated**: 2026-03-21
 
 ### Phase 0 (complete)
@@ -77,6 +77,29 @@ Build a competitive BTOR2 model checker based on Bitvector Decision Diagrams (BV
 - [x] Fixed Solve ground check to verify value against target set
 - [x] CLI: --bound N option for BMC depth
 - [x] **11/11 benchmarks correct** (9 combinational + 2 sequential: counter_sat, counter_unsat)
+- [x] 82 total tests, 0 clippy warnings
+
+### Phase 6 (complete)
+- [x] Boolean decomposition: find comparison subterms in 1-bit expressions, branch true/false
+- [x] Compiled evaluator wired into generalized blast for fast single-variable enumeration
+- [x] Domain budget: 2^28 with compiled evaluator (up from 2^20)
+- [x] 4-stage theory resolution cascade: bool decomp → compiled blast → byte-blast → oracle
+
+### Phase 7 (complete)
+- [x] SMT oracle (`bitr/src/oracle.rs`): term→SMT-LIB2, subprocess invocation, result parsing
+- [x] Oracle caching via HashMap
+- [x] Auto-detect solver binary (bitwuzla, boolector, z3)
+- [x] Byte-blast oracle in solver: split widest var MSB byte, enumerate 256×LSB values
+- [x] Adaptive bailout (25% threshold), max depth 4
+- [x] Oracle integration via `set_oracle()` callback on SolverContext
+
+### Phase 9 (complete)
+- [x] Array state tracking (Base / Write chain) in lifter
+- [x] READ-over-WRITE expansion: READ(WRITE(a,w,v), r) → ITE(EQ(r,w), v, READ(a,r))
+- [x] Nested write chains → nested ITE chains
+- [x] Array input/state handling with sort detection
+- [x] Array benchmarks: array_row_sat, array_row_unsat
+- [x] **13/13 benchmarks correct** (9 combinational + 2 sequential + 2 array)
 - [x] 82 total tests, 0 clippy warnings
 
 ## Implementation Phases
