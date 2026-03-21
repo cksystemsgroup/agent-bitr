@@ -81,6 +81,8 @@ fn map_op(name: &str) -> Option<OpKind> {
         "redxor" => Some(OpKind::Redxor),
         "uaddo" => Some(OpKind::Uaddo),
         "umulo" => Some(OpKind::Umulo),
+        // Derived ops (not in OpKind — handled as combinations)
+        "xnor" | "implies" | "nand" | "nor" => None,
         _ => None,
     }
 }
@@ -199,7 +201,8 @@ pub fn lift_btor2(model: &Btor2Model) -> Result<LiftedModel, String> {
             }
             "const" | "constd" | "consth" => {
                 let width = get_width(node.sort_id)?;
-                let val = parse_const_value(op, &node.args, width)?;
+                let val = parse_const_value(op, &node.args, width)
+                    .map_err(|e| format!("nid {}: {}", node.nid, e))?;
                 let bvc = bm.make_const(&mut tt, &ct, val, width);
                 nid_to_bvc.insert(node.nid, bvc);
             }
@@ -293,6 +296,40 @@ pub fn lift_btor2(model: &Btor2Model) -> Result<LiftedModel, String> {
                     term: ext_term,
                     constraint,
                 }]);
+                nid_to_bvc.insert(node.nid, bvc);
+            }
+            // Derived operators: express as combinations of base ops
+            "xnor" => {
+                let width = get_width(node.sort_id)?;
+                let a = resolve_ref(&nid_to_bvc, &mut bm, &mut tt, &mut ct, node.args[0])?;
+                let b = resolve_ref(&nid_to_bvc, &mut bm, &mut tt, &mut ct, node.args[1])?;
+                let xor_bvc = bm.apply(&mut tt, &mut ct, OpKind::Xor, &[a, b], width);
+                let bvc = bm.apply(&mut tt, &mut ct, OpKind::Not, &[xor_bvc], width);
+                nid_to_bvc.insert(node.nid, bvc);
+            }
+            "implies" => {
+                // implies(a, b) = or(not(a), b)
+                let width = get_width(node.sort_id)?;
+                let a = resolve_ref(&nid_to_bvc, &mut bm, &mut tt, &mut ct, node.args[0])?;
+                let b = resolve_ref(&nid_to_bvc, &mut bm, &mut tt, &mut ct, node.args[1])?;
+                let not_a = bm.apply(&mut tt, &mut ct, OpKind::Not, &[a], width);
+                let bvc = bm.apply(&mut tt, &mut ct, OpKind::Or, &[not_a, b], width);
+                nid_to_bvc.insert(node.nid, bvc);
+            }
+            "nand" => {
+                let width = get_width(node.sort_id)?;
+                let a = resolve_ref(&nid_to_bvc, &mut bm, &mut tt, &mut ct, node.args[0])?;
+                let b = resolve_ref(&nid_to_bvc, &mut bm, &mut tt, &mut ct, node.args[1])?;
+                let and_bvc = bm.apply(&mut tt, &mut ct, OpKind::And, &[a, b], width);
+                let bvc = bm.apply(&mut tt, &mut ct, OpKind::Not, &[and_bvc], width);
+                nid_to_bvc.insert(node.nid, bvc);
+            }
+            "nor" => {
+                let width = get_width(node.sort_id)?;
+                let a = resolve_ref(&nid_to_bvc, &mut bm, &mut tt, &mut ct, node.args[0])?;
+                let b = resolve_ref(&nid_to_bvc, &mut bm, &mut tt, &mut ct, node.args[1])?;
+                let or_bvc = bm.apply(&mut tt, &mut ct, OpKind::Or, &[a, b], width);
+                let bvc = bm.apply(&mut tt, &mut ct, OpKind::Not, &[or_bvc], width);
                 nid_to_bvc.insert(node.nid, bvc);
             }
             // Reverse comparisons: swap arguments

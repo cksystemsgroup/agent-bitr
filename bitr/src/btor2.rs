@@ -65,6 +65,41 @@ pub fn parse_btor2(input: &str) -> Result<Btor2Model, String> {
                     sorts.push((nid, Btor2Sort::Array { index_width: iw, element_width: ew }));
                 }
             }
+            // Binary constant: value is a binary string
+            "const" => {
+                let sort_id: u32 = parts[2].parse().unwrap_or(0);
+                let bin_str = if parts.len() > 3 { parts[3] } else { "0" };
+                let val = u64::from_str_radix(bin_str, 2).unwrap_or(0) as i64;
+                nodes.push(Btor2Node {
+                    nid, op: "constd".to_string(), sort_id,
+                    args: vec![val],
+                    symbol: parts.get(4).map(|s| s.to_string()),
+                });
+            }
+            // Hex constant: value is a hex string
+            "consth" => {
+                let sort_id: u32 = parts[2].parse().unwrap_or(0);
+                let hex_str = if parts.len() > 3 { parts[3] } else { "0" };
+                let val = u64::from_str_radix(hex_str, 16).unwrap_or(0) as i64;
+                nodes.push(Btor2Node {
+                    nid, op: "constd".to_string(), sort_id,
+                    args: vec![val],
+                    symbol: parts.get(4).map(|s| s.to_string()),
+                });
+            }
+            // Decimal constant: value may be large unsigned
+            "constd" => {
+                let sort_id: u32 = parts[2].parse().unwrap_or(0);
+                let val_str = if parts.len() > 3 { parts[3] } else { "0" };
+                // Try i64 first, then u64 for large values
+                let val = val_str.parse::<i64>()
+                    .unwrap_or_else(|_| val_str.parse::<u64>().unwrap_or(0) as i64);
+                nodes.push(Btor2Node {
+                    nid, op: "constd".to_string(), sort_id,
+                    args: vec![val],
+                    symbol: parts.get(4).map(|s| s.to_string()),
+                });
+            }
             "bad" => {
                 let arg: u32 = parts[2].parse().map_err(|e| format!("bad arg: {}", e))?;
                 bad_properties.push(arg);
