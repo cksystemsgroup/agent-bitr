@@ -1,0 +1,12 @@
+[package]
+name = "bitr"
+version = "0.1.0"
+edition = "2021"
+description = "BVDD-based incremental theory resolver for BTOR2 model checking"
+
+[[bin]]
+name = "bitr"
+path = "src/main.rs"
+
+[dependencies]
+bvdd = { path = "../bvdd" }

@@ -1,0 +1,10 @@
+[package]
+name = "bvdd"
+version = "0.1.0"
+edition = "2021"
+description = "Bitvector Decision Diagrams — canonical decision diagrams with 256-bit bitmask edge labels"
+license = "MIT"
+
+[lib]
+name = "bvdd"
+path = "src/lib.rs"

@@ -1,0 +1,14 @@
+; SAT: slice(concat(x, y), 3, 2) == 3 for 2-bit x, y
+; concat(x,y) is 4 bits, slice [3:2] extracts x
+; So x == 3, which is satisfiable
+; Expected: SAT
+1 sort bitvec 2
+2 sort bitvec 4
+3 sort bitvec 1
+4 input 1 x
+5 input 1 y
+6 concat 2 4 5
+7 slice 1 6 3 2
+8 constd 1 3
+9 eq 3 7 8
+10 bad 9
