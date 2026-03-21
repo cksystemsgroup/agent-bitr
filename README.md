@@ -75,7 +75,7 @@ Phases 0–9 complete. Core solver operational on combinational, sequential, and
 
 | Metric | bitr | bitwuzla | rIC3 |
 |--------|------|----------|------|
-| HW BV solved (≤500K, 10s) | 62/155 | — | — |
+| HW BV solved (≤500K, 10s) | 71/155 | — | — |
 | HW Array solved | 0/321 | — | — |
 | SW BV solved | — | — | — |
 | Total time (s) | — | — | — |
