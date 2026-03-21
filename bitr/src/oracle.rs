@@ -38,6 +38,7 @@ impl SmtOracle {
     }
 
     /// Check if the solver binary exists
+    #[allow(dead_code)]
     pub fn is_available(&self) -> bool {
         Command::new(&self.solver_path)
             .arg("--version")

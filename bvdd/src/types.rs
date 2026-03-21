@@ -89,7 +89,7 @@ impl OpKind {
         match self {
             OpKind::Not | OpKind::Neg |
             OpKind::Redand | OpKind::Redor | OpKind::Redxor |
-            OpKind::Slice => 1,
+            OpKind::Slice | OpKind::Uext | OpKind::Sext => 1,
             OpKind::Ite | OpKind::Write => 3,
             _ => 2,
         }

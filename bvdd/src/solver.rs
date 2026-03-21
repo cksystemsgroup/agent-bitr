@@ -487,7 +487,8 @@ impl<'a> SolverContext<'a> {
         self.generalized_blast_recursive(bvc, s, vars, constraint, term, width)
     }
 
-    /// Recursive generalized blast: enumerate narrowest variable, SubstAndFold, recurse
+    /// Recursive generalized blast: enumerate narrowest variable, SubstAndFold, recurse.
+    /// Uses compiled evaluator when all remaining variables fit in the budget.
     fn generalized_blast_recursive(
         &mut self,
         bvc: BvcId,
@@ -498,7 +499,6 @@ impl<'a> SolverContext<'a> {
         width: u16,
     ) -> BvddId {
         if vars.is_empty() {
-            // Ground — evaluate directly
             let eval_bvc = {
                 use crate::bvc::BvcEntry;
                 self.bm.alloc(width, vec![BvcEntry { term, constraint }])
@@ -506,7 +506,28 @@ impl<'a> SolverContext<'a> {
             return self.theory_resolve_ground(eval_bvc, s);
         }
 
-        // Find narrowest variable
+        // Try compiled multi-variable evaluation if total domain is small
+        let total_domain: u128 = vars.iter()
+            .map(|&(_, w)| if w >= 64 { u128::MAX } else { 1u128 << w })
+            .fold(1u128, |acc, d| acc.saturating_mul(d));
+
+        if total_domain <= 65536 {
+            let prog = CompiledProgram::compile(self.tt, term);
+            // Check all variable slots are available
+            let slots: Vec<(u32, u32, u64)> = vars.iter().filter_map(|&(vid, vw)| {
+                let domain = if vw >= 64 { u64::MAX } else { 1u64 << vw };
+                prog.var_slot(vid).map(|slot| (vid, slot, domain))
+            }).collect();
+
+            if slots.len() == vars.len() {
+                // All variables have slots — use compiled evaluator
+                let mut slot_vals = vec![0u64; prog.num_vars as usize];
+                let result = self.compiled_multi_eval(&prog, &slots, 0, &mut slot_vals, s, width);
+                return result;
+            }
+        }
+
+        // Fallback: single-variable enumeration with SubstAndFold
         let (var_id, var_width) = *vars.iter()
             .min_by_key(|&&(_, w)| w)
             .unwrap();
@@ -522,25 +543,6 @@ impl<'a> SolverContext<'a> {
             .collect();
 
         let mut result_edges: Vec<BvddEdge> = Vec::new();
-
-        // For single remaining variable with small domain, use compiled evaluator
-        if remaining_vars.is_empty() && domain_size <= 65536 {
-            let prog = CompiledProgram::compile(self.tt, term);
-            if let Some(slot_idx) = prog.var_slot(var_id) {
-                let mut slot_vars = vec![0u64; prog.num_vars as usize];
-                for d in 0..domain_size {
-                    slot_vars[slot_idx as usize] = d;
-                    let val = prog.eval(&slot_vars);
-                    let check_val = mask_for_check(val, width);
-                    if s.contains(check_val) {
-                        let const_bvc = self.bm.make_const(self.tt, self.ct, val, width);
-                        self.sat_witnesses += 1;
-                        return self.mgr.make_terminal(const_bvc, true, true);
-                    }
-                }
-                return self.mgr.false_terminal();
-            }
-        }
 
         for d in 0..domain_size {
             let new_term = self.tt.subst_and_fold(term, var_id, d);
@@ -585,6 +587,39 @@ impl<'a> SolverContext<'a> {
             let label = self.mgr.make_terminal(var_label_bvc, true, false);
             self.mgr.make_decision(label, result_edges)
         }
+    }
+
+    /// Multi-variable compiled evaluation: recursively enumerate variable slots.
+    fn compiled_multi_eval(
+        &mut self,
+        prog: &CompiledProgram,
+        slots: &[(u32, u32, u64)], // (var_id, slot_idx, domain_size)
+        slot_pos: usize,
+        slot_vals: &mut [u64],
+        s: ValueSet,
+        width: u16,
+    ) -> BvddId {
+        if slot_pos >= slots.len() {
+            // All variables assigned — evaluate
+            let val = prog.eval(slot_vals);
+            let check_val = mask_for_check(val, width);
+            if s.contains(check_val) {
+                let const_bvc = self.bm.make_const(self.tt, self.ct, val, width);
+                self.sat_witnesses += 1;
+                return self.mgr.make_terminal(const_bvc, true, true);
+            }
+            return self.mgr.false_terminal();
+        }
+
+        let (_var_id, slot_idx, domain_size) = slots[slot_pos];
+        for d in 0..domain_size {
+            slot_vals[slot_idx as usize] = d;
+            let result = self.compiled_multi_eval(prog, slots, slot_pos + 1, slot_vals, s, width);
+            if self.mgr.get(result).can_be_true && self.mgr.get(result).is_ground {
+                return result; // Early SAT
+            }
+        }
+        self.mgr.false_terminal()
     }
 
     /// Stage 3: Byte-blast oracle — split widest variable's MSB byte,

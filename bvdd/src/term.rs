@@ -157,6 +157,45 @@ impl TermTable {
             }
         }
     }
+
+    /// Substitute variable `var` with another term `replacement`.
+    /// If the replacement causes all args to become constants, folds the result.
+    pub fn subst_term(&mut self, id: TermId, var: u32, replacement: TermId) -> TermId {
+        let term = self.get(id).clone();
+        match &term.kind {
+            TermKind::Const(_) => id,
+            TermKind::Var(v) => {
+                if *v == var { replacement } else { id }
+            }
+            TermKind::App { op, args, slice_upper, slice_lower } => {
+                let op = *op;
+                let su = *slice_upper;
+                let sl = *slice_lower;
+                let width = term.width;
+                let new_args: Vec<TermId> = args.iter()
+                    .map(|&a| self.subst_term(a, var, replacement))
+                    .collect();
+
+                // Try constant folding
+                let all_const: Option<Vec<u64>> = new_args.iter().map(|&a| {
+                    if let TermKind::Const(v) = self.get(a).kind { Some(v) } else { None }
+                }).collect();
+
+                if let Some(const_vals) = all_const {
+                    let arg_widths: Vec<BvWidth> = new_args.iter()
+                        .map(|&a| self.get(a).width)
+                        .collect();
+                    let result = eval_op(op, &const_vals, &arg_widths, width, su, sl);
+                    self.make_const(result, width)
+                } else {
+                    self.intern(
+                        TermKind::App { op, args: new_args, slice_upper: su, slice_lower: sl },
+                        width,
+                    )
+                }
+            }
+        }
+    }
 }
 
 /// Mask a value to `width` bits

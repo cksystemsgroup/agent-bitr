@@ -146,7 +146,8 @@ pub fn bmc_check(
 }
 
 /// Substitute state variable references in a BVC's term.
-/// Replaces Var(state_nid) with the current state BVC's term via SubstAndFold.
+/// Replaces Var(state_nid) with the current state BVC's term.
+/// Uses constant substitution when possible, term-for-term otherwise.
 fn substitute_states(
     tt: &mut TermTable,
     _ct: &mut ConstraintTable,
@@ -163,13 +164,13 @@ fn substitute_states(
     for (&nid, &current_bvc) in state_current {
         let current_term = bm.get(current_bvc).entries[0].term;
 
-        // Check if the current state is a constant
         if let bvdd::term::TermKind::Const(val) = tt.get(current_term).kind {
+            // Constant: use fast subst_and_fold
             term = tt.subst_and_fold(term, nid, val);
+        } else {
+            // Symbolic: use term-for-term substitution
+            term = tt.subst_term(term, nid, current_term);
         }
-        // For non-constant states, we'd need term-for-term substitution
-        // (not just constant substitution). For now, skip — the term
-        // will have unresolved variables that theory resolution handles.
     }
 
     bm.alloc(width, vec![BvcEntry {
