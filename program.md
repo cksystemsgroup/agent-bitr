@@ -12,9 +12,10 @@ Build a competitive BTOR2 model checker based on Bitvector Decision Diagrams (BV
 
 ## Current Status
 
-**Phase**: 0 — Scaffolding
+**Phase**: 8 — BMC Loop (complete)
 **Last updated**: 2026-03-21
 
+### Phase 0 (complete)
 - [x] Repository structure created
 - [x] Cargo workspace configured
 - [x] Core types defined (`bvdd/src/types.rs`)
@@ -27,8 +28,56 @@ Build a competitive BTOR2 model checker based on Bitvector Decision Diagrams (BV
 - [x] BTOR2 parser (`bitr/src/btor2.rs`)
 - [x] CLI entry point (`bitr/src/main.rs`)
 - [x] Tiny benchmarks committed
-- [ ] `cargo test` all passing
-- [ ] `cargo clippy` clean
+- [x] `cargo test` all passing (40 tests)
+- [x] `cargo clippy` clean
+
+### Phase 1 (complete)
+- [x] ValueSet: xor, insert, remove, min/max_element, from_fn, iter (11 tests)
+- [x] TermTable: SubstAndFold with constant folding (4 tests)
+- [x] Recursive term evaluator — all OpKind variants (12 tests)
+- [x] Compiled term evaluator (`bvdd/src/eval.rs`) — register machine (10 tests)
+- [x] Cross-validation: compiled vs recursive agree on all inputs
+
+### Phase 2 (complete)
+- [x] Constraint hash consing via unique table (12 tests)
+- [x] Restrict operation with short-circuit AND/OR
+- [x] Predicate simplification (empty→FALSE, full→TRUE)
+- [x] AND/OR normalization for better hash consing
+- [x] collect_preds, has_no_predicates helpers
+- [x] BVC Apply: structural (PRED constraints) and lifted (fresh vars) (6 tests)
+- [x] BTOR2→BVC lifter (`bitr/src/lifter.rs`) — all operators + constants (5 tests)
+- [x] 61 total tests, 0 clippy warnings
+
+### Phase 3 (complete)
+- [x] BVDD unique table hash consing (terminals + decision nodes)
+- [x] FALSE terminal (BvddId(0)) with FullyCanonical canonicity
+- [x] Edge merging: same-child edges get OR'd value sets
+- [x] Empty-edge filtering and single-FULL-edge collapse
+- [x] Bottom-up flag computation (can_be_true, is_ground)
+- [x] All-FALSE-children collapse to FALSE terminal
+- [x] Direct-mapped computed cache (64K entries) for Solve results
+- [x] restrict_to_valueset with cache integration
+- [x] 74 total tests, 0 clippy warnings
+
+### Phase 4-5 (complete)
+- [x] Solve algorithm with ground check, terminal→Canonicalize, decision traversal
+- [x] Canonicalize with 6 phases: ground, SAT witness, UNSAT prune, no-preds, Decide, Restrict
+- [x] Decide: predicate selection + coarsest partition
+- [x] Generalized blast: narrowest-variable-first enumeration (budget 2^20)
+- [x] Theory resolution for predicate-free constraints
+- [x] BTOR2→BVC lifter with all operators, slice/ext special handling
+- [x] CLI integration: parse → lift → solve → output sat/unsat
+- [x] **9/9 tiny benchmarks correct** (6 SAT, 3 UNSAT)
+- [x] 82 total tests, 0 clippy warnings
+
+### Phase 8 (complete)
+- [x] BMC loop: init/next substitution, step-by-step unrolling
+- [x] Automatic sequential/combinational detection
+- [x] State variable substitution with SubstAndFold
+- [x] Fixed Solve ground check to verify value against target set
+- [x] CLI: --bound N option for BMC depth
+- [x] **11/11 benchmarks correct** (9 combinational + 2 sequential: counter_sat, counter_unsat)
+- [x] 82 total tests, 0 clippy warnings
 
 ## Implementation Phases
 

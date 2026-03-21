@@ -112,6 +112,94 @@ impl ValueSet {
             bits: [(1u64 << domain_size) - 1, 0, 0, 0],
         }
     }
+
+    /// Symmetric difference (XOR)
+    pub fn xor(self, other: ValueSet) -> ValueSet {
+        ValueSet {
+            bits: [
+                self.bits[0] ^ other.bits[0],
+                self.bits[1] ^ other.bits[1],
+                self.bits[2] ^ other.bits[2],
+                self.bits[3] ^ other.bits[3],
+            ],
+        }
+    }
+
+    /// Insert a value into the set
+    pub fn insert(self, v: u8) -> ValueSet {
+        self.or(ValueSet::singleton(v))
+    }
+
+    /// Remove a value from the set
+    pub fn remove(self, v: u8) -> ValueSet {
+        self.and(ValueSet::singleton(v).complement())
+    }
+
+    /// Smallest element, or None if empty
+    pub fn min_element(self) -> Option<u8> {
+        for (i, &w) in self.bits.iter().enumerate() {
+            if w != 0 {
+                return Some((i as u8) * 64 + w.trailing_zeros() as u8);
+            }
+        }
+        None
+    }
+
+    /// Largest element, or None if empty
+    pub fn max_element(self) -> Option<u8> {
+        for i in (0..4).rev() {
+            if self.bits[i] != 0 {
+                return Some((i as u8) * 64 + 63 - self.bits[i].leading_zeros() as u8);
+            }
+        }
+        None
+    }
+
+    /// Create a set from a predicate: includes v where f(v) is true
+    pub fn from_fn(f: impl Fn(u8) -> bool) -> ValueSet {
+        let mut vs = ValueSet::EMPTY;
+        for v in 0..=255u8 {
+            if f(v) {
+                let word = (v / 64) as usize;
+                let bit = v % 64;
+                vs.bits[word] |= 1u64 << bit;
+            }
+        }
+        vs
+    }
+
+    /// Iterate over all values in the set
+    pub fn iter(self) -> ValueSetIter {
+        ValueSetIter { vs: self, pos: 0 }
+    }
+}
+
+/// Iterator over values in a ValueSet
+pub struct ValueSetIter {
+    vs: ValueSet,
+    pos: u16,
+}
+
+impl Iterator for ValueSetIter {
+    type Item = u8;
+
+    fn next(&mut self) -> Option<u8> {
+        while self.pos < 256 {
+            let v = self.pos as u8;
+            self.pos += 1;
+            let word = (v / 64) as usize;
+            let bit = v % 64;
+            if (self.vs.bits[word] >> bit) & 1 == 1 {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.vs.popcount() as usize;
+        (0, Some(remaining))
+    }
 }
 
 impl ops::Not for ValueSet {
@@ -194,5 +282,63 @@ mod tests {
         assert!(full.contains(0));
         assert!(full.contains(3));
         assert!(!full.contains(4));
+    }
+
+    #[test]
+    fn test_xor() {
+        let a = ValueSet::singleton(1).or(ValueSet::singleton(2));
+        let b = ValueSet::singleton(2).or(ValueSet::singleton(3));
+        let x = a.xor(b);
+        assert!(x.contains(1));
+        assert!(!x.contains(2));
+        assert!(x.contains(3));
+        assert_eq!(x.popcount(), 2);
+    }
+
+    #[test]
+    fn test_min_max_element() {
+        assert_eq!(ValueSet::EMPTY.min_element(), None);
+        assert_eq!(ValueSet::EMPTY.max_element(), None);
+        assert_eq!(ValueSet::singleton(42).min_element(), Some(42));
+        assert_eq!(ValueSet::singleton(42).max_element(), Some(42));
+
+        let s = ValueSet::singleton(10).or(ValueSet::singleton(200));
+        assert_eq!(s.min_element(), Some(10));
+        assert_eq!(s.max_element(), Some(200));
+
+        assert_eq!(ValueSet::FULL.min_element(), Some(0));
+        assert_eq!(ValueSet::FULL.max_element(), Some(255));
+    }
+
+    #[test]
+    fn test_insert_remove() {
+        let s = ValueSet::EMPTY.insert(5).insert(10);
+        assert_eq!(s.popcount(), 2);
+        let s2 = s.remove(5);
+        assert_eq!(s2, ValueSet::singleton(10));
+    }
+
+    #[test]
+    fn test_from_fn() {
+        let evens = ValueSet::from_fn(|v| v % 2 == 0);
+        assert_eq!(evens.popcount(), 128);
+        assert!(evens.contains(0));
+        assert!(evens.contains(254));
+        assert!(!evens.contains(1));
+    }
+
+    #[test]
+    fn test_iter() {
+        let s = ValueSet::singleton(3).or(ValueSet::singleton(7)).or(ValueSet::singleton(250));
+        let vals: Vec<u8> = s.iter().collect();
+        assert_eq!(vals, vec![3, 7, 250]);
+    }
+
+    #[test]
+    fn test_from_range() {
+        let r = ValueSet::from_range(10, 15);
+        assert_eq!(r.popcount(), 6);
+        let vals: Vec<u8> = r.iter().collect();
+        assert_eq!(vals, vec![10, 11, 12, 13, 14, 15]);
     }
 }
