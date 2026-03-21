@@ -12,7 +12,7 @@ Build a competitive BTOR2 model checker based on Bitvector Decision Diagrams (BV
 
 ## Current Status
 
-**Phase**: 9 — Array Support (complete)
+**Phase**: 10 — Optimization ready
 **Last updated**: 2026-03-21
 
 ### Phase 0 (complete)
@@ -101,6 +101,17 @@ Build a competitive BTOR2 model checker based on Bitvector Decision Diagrams (BV
 - [x] Array benchmarks: array_row_sat, array_row_unsat
 - [x] **13/13 benchmarks correct** (9 combinational + 2 sequential + 2 array)
 - [x] 82 total tests, 0 clippy warnings
+
+### Completions (post-Phase 9)
+- [x] Oracle wired into CLI: auto-detect bitwuzla/boolector/z3, --no-oracle flag
+- [x] BMC term-for-term substitution: subst_term for symbolic next-state expressions
+- [x] HSC cascade implemented: MSB→LSB 8-bit slice decomposition + tests
+- [x] Multi-variable compiled blast: full enumeration via CompiledProgram (≤65536 total)
+- [x] Counterexample extraction: extract_witness walks BVDD + records during blast
+- [x] Witness display: --verbose prints variable assignments on SAT
+- [x] Fixed Uext/Sext arity (1, not 2)
+- [x] New benchmark: shift_reg_sat (4-bit shift register, symbolic BMC)
+- [x] **14/14 benchmarks correct**, 87 tests, 0 clippy warnings
 
 ## Implementation Phases
 

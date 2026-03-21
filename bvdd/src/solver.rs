@@ -36,6 +36,8 @@ pub struct SolverContext<'a> {
     /// Oracle function: term→SMT-LIB2, invoke external solver
     #[allow(clippy::type_complexity)]
     pub oracle_fn: Option<Box<dyn FnMut(&TermTable, crate::types::TermId, u16, ValueSet) -> SolveResult + 'a>>,
+    /// Witness: variable assignments when SAT is found (var_id → value)
+    pub witness: HashMap<u32, u64>,
 }
 
 impl<'a> SolverContext<'a> {
@@ -63,6 +65,7 @@ impl<'a> SolverContext<'a> {
             byte_blast_calls: 0,
             oracle_calls: 0,
             oracle_fn: None,
+            witness: HashMap::new(),
         }
     }
 
@@ -474,6 +477,7 @@ impl<'a> SolverContext<'a> {
                     let val = prog.eval(&slot_vars);
                     let check_val = mask_for_check(val, width);
                     if s.contains(check_val) {
+                        self.witness.insert(var_id, d);
                         let const_bvc = self.bm.make_const(self.tt, self.ct, val, width);
                         self.sat_witnesses += 1;
                         return self.mgr.make_terminal(const_bvc, true, true);
@@ -560,6 +564,7 @@ impl<'a> SolverContext<'a> {
             };
 
             if self.mgr.get(result).can_be_true && self.mgr.get(result).is_ground {
+                self.witness.insert(var_id, d);
                 return result; // Early SAT
             }
 
@@ -604,6 +609,10 @@ impl<'a> SolverContext<'a> {
             let val = prog.eval(slot_vals);
             let check_val = mask_for_check(val, width);
             if s.contains(check_val) {
+                // Record witness assignments
+                for &(var_id, slot_idx, _) in slots {
+                    self.witness.insert(var_id, slot_vals[slot_idx as usize]);
+                }
                 let const_bvc = self.bm.make_const(self.tt, self.ct, val, width);
                 self.sat_witnesses += 1;
                 return self.mgr.make_terminal(const_bvc, true, true);
@@ -768,6 +777,86 @@ impl<'a> SolverContext<'a> {
         }
         self.unsat_terminals += 1;
         self.mgr.false_terminal()
+    }
+
+    /// Extract a witness (variable→value map) from a SAT result.
+    /// Walks the solved BVDD and evaluates the term to find assignments.
+    pub fn extract_witness(&mut self, id: BvddId, target: ValueSet) -> HashMap<u32, u64> {
+        let mut witness = HashMap::new();
+
+        // Walk decision nodes collecting edge labels
+        let mut current = id;
+        loop {
+            let node = self.mgr.get(current).clone();
+            match &node.kind {
+                BvddNodeKind::Terminal { bvc } => {
+                    // At terminal: collect variables from the term
+                    let entry = &self.bm.get(*bvc).entries[0];
+                    let term = entry.term;
+                    let vars = self.tt.collect_vars(term);
+
+                    if vars.is_empty() {
+                        // Ground: no variables to assign
+                        break;
+                    }
+
+                    // Try to find a satisfying assignment via evaluation
+                    let width = self.bm.get(*bvc).width;
+                    let prog = CompiledProgram::compile(self.tt, term);
+                    let mut slot_vals = vec![0u64; prog.num_vars as usize];
+
+                    // Simple search: try 0 for each variable, then increment
+                    'search: for _ in 0..1000 {
+                        let val = prog.eval(&slot_vals);
+                        let check = mask_for_check(val, width);
+                        if target.contains(check) {
+                            for &(var_id, _) in &vars {
+                                if let Some(slot) = prog.var_slot(var_id) {
+                                    witness.insert(var_id, slot_vals[slot as usize]);
+                                }
+                            }
+                            break 'search;
+                        }
+                        // Increment first variable
+                        if let Some(slot) = prog.var_slot(vars[0].0) {
+                            slot_vals[slot as usize] += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    break;
+                }
+                BvddNodeKind::Decision { label, edges } => {
+                    // Pick the first non-FALSE edge
+                    let mut found = false;
+                    for edge in edges {
+                        let child = self.mgr.get(edge.child);
+                        if child.can_be_true || !self.mgr.is_false(edge.child) {
+                            // Record: the label variable takes a value from this edge's label set
+                            if let BvddNodeKind::Terminal { bvc } = self.mgr.get(*label).kind {
+                                let label_entry = &self.bm.get(bvc).entries[0];
+                                if let TermKind::Var(var_id) = self.tt.get(label_entry.term).kind {
+                                    if let Some(v) = edge.label.min_element() {
+                                        witness.insert(var_id, v as u64);
+                                    }
+                                }
+                            }
+                            current = edge.child;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found { break; }
+                }
+            }
+        }
+
+        // Merge with any assignments recorded during solving
+        for (k, v) in &self.witness {
+            witness.entry(*k).or_insert(*v);
+        }
+
+        witness
     }
 
     /// Get the solve result from a BVDD

@@ -191,7 +191,7 @@ fn solve_combinational(
         let target = ValueSet::singleton(1);
 
         let (result, solve_calls, canon_calls, decide_calls, sat_w, unsat_t, restrict_c,
-             oracle_calls, compiled_calls) = {
+             oracle_calls, compiled_calls, witness) = {
             let mut ctx = SolverContext::new(
                 &mut lifted.tt,
                 &mut lifted.ct,
@@ -206,9 +206,14 @@ fn solve_combinational(
             }
             let result_bvdd = ctx.solve(terminal, target);
             let result = ctx.get_result(result_bvdd);
+            let witness = if result == SolveResult::Sat {
+                ctx.extract_witness(result_bvdd, target)
+            } else {
+                std::collections::HashMap::new()
+            };
             (result, ctx.solve_calls, ctx.canonicalize_calls, ctx.decide_calls,
              ctx.sat_witnesses, ctx.unsat_terminals, ctx.restrict_calls,
-             ctx.oracle_calls, ctx.compiled_blast_calls)
+             ctx.oracle_calls, ctx.compiled_blast_calls, witness)
         };
 
         if verbose {
@@ -230,6 +235,17 @@ fn solve_combinational(
             SolveResult::Sat => {
                 if verbose {
                     eprintln!("bitr: bad[{}] is reachable", i);
+                    if !witness.is_empty() {
+                        eprintln!("bitr: witness:");
+                        let mut sorted: Vec<_> = witness.iter().collect();
+                        sorted.sort_by_key(|(&k, _)| k);
+                        for (&var_id, &val) in &sorted {
+                            // Skip lifted variables (high range)
+                            if var_id < 0x1000_0000 {
+                                eprintln!("  v{} = {}", var_id, val);
+                            }
+                        }
+                    }
                 }
                 return SolveResult::Sat;
             }
