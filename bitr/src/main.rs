@@ -194,6 +194,25 @@ fn solve_smtlib2(
         eprintln!("  Cache hits/misses: {}/{}", mgr.cache_hits, mgr.cache_misses);
     }
 
+    // If BVDD solver returns Unknown, fall back to external solver on original input
+    if result == SolveResult::Unknown {
+        if let Some(path) = solver_path {
+            if verbose {
+                eprintln!("bitr: BVDD returned Unknown, falling back to oracle on raw SMT-LIB2");
+            }
+            // Write the original input to a temp file and solve directly
+            let tmp = std::env::temp_dir().join("bitr_smt2_fallback.smt2");
+            if std::fs::write(&tmp, input).is_ok() {
+                let oracle_result = oracle::solve_smtlib2_file(path, tmp.to_str().unwrap_or(""));
+                let _ = std::fs::remove_file(&tmp);
+                if verbose {
+                    eprintln!("bitr: oracle={:?}", oracle_result);
+                }
+                return oracle_result;
+            }
+        }
+    }
+
     result
 }
 

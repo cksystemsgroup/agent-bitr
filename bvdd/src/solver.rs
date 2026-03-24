@@ -4,6 +4,8 @@
 //! See `.claude/commands/bitr-expert.md` Sections 3-4.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use crate::types::{BvddId, BvcId, ConstraintId, SolveResult, OpKind};
 use crate::valueset::ValueSet;
 use crate::term::{TermTable, TermKind};
@@ -38,6 +40,12 @@ pub struct SolverContext<'a> {
     pub oracle_fn: Option<Box<dyn FnMut(&TermTable, crate::types::TermId, u16, ValueSet) -> SolveResult + 'a>>,
     /// Witness: variable assignments when SAT is found (var_id → value)
     pub witness: HashMap<u32, u64>,
+    /// Wall-clock start time for timeout
+    start_time: std::time::Instant,
+    /// Timeout in seconds (0 = no timeout)
+    pub solve_timeout_s: f64,
+    /// Shared cancellation flag for parallel operations
+    pub cancelled: Arc<AtomicBool>,
 }
 
 impl<'a> SolverContext<'a> {
@@ -66,6 +74,9 @@ impl<'a> SolverContext<'a> {
             oracle_calls: 0,
             oracle_fn: None,
             witness: HashMap::new(),
+            start_time: std::time::Instant::now(),
+            solve_timeout_s: 5.0,
+            cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -74,12 +85,28 @@ impl<'a> SolverContext<'a> {
         self.oracle_fn = Some(Box::new(f));
     }
 
+    /// Check if solve has timed out
+    #[inline]
+    fn timed_out(&self) -> bool {
+        if self.cancelled.load(Ordering::Relaxed) {
+            return true;
+        }
+        if self.solve_timeout_s > 0.0 &&
+           self.solve_calls.is_multiple_of(100) &&
+           self.start_time.elapsed().as_secs_f64() > self.solve_timeout_s
+        {
+            self.cancelled.store(true, Ordering::Relaxed);
+            return true;
+        }
+        false
+    }
+
     /// Solve(G, S): traverse BVDD G restricted to value set S
     pub fn solve(&mut self, g: BvddId, s: ValueSet) -> BvddId {
         self.solve_calls += 1;
 
-        // Depth budget
-        if self.depth > self.max_depth {
+        // Depth budget or timeout
+        if self.depth > self.max_depth || self.timed_out() {
             return g;
         }
 
@@ -158,6 +185,9 @@ impl<'a> SolverContext<'a> {
     /// Canonicalize(v, S): canonicalize BVC v under value set S
     pub fn canonicalize(&mut self, bvc: BvcId, s: ValueSet) -> BvddId {
         self.canonicalize_calls += 1;
+        if self.cancelled.load(Ordering::Relaxed) {
+            return self.mgr.make_terminal(bvc, true, false);
+        }
 
         // Phase 1: ground check
         if self.bm.is_ground(self.tt, bvc) {
@@ -308,6 +338,13 @@ impl<'a> SolverContext<'a> {
 
         if vars.is_empty() {
             return self.theory_resolve_ground(bvc, s);
+        }
+
+        // Timeout check — skip directly to oracle
+        if self.solve_timeout_s > 0.0 &&
+           self.start_time.elapsed().as_secs_f64() > self.solve_timeout_s {
+            self.cancelled.store(true, Ordering::Relaxed);
+            return self.invoke_oracle(bvc, s);
         }
 
         // Stage 1: Boolean decomposition for 1-bit comparison subterms
@@ -474,15 +511,27 @@ impl<'a> SolverContext<'a> {
             .map(|&(_, _, d)| d as u128)
             .fold(1u128, |acc, d| acc.saturating_mul(d));
 
-        if total_domain > (1u128 << 28) {
-            return self.mgr.make_terminal(bvc, true, false);
+        if total_domain > (1u128 << 28) || self.timed_out() {
+            // Domain too large or timed out — fall through to oracle
+            return self.invoke_oracle(bvc, s);
         }
 
         // Use parallel search for large domains (> 1M), sequential for small
         let use_parallel = total_domain > 1_000_000;
 
         if use_parallel {
-            if let Some((slot_vals, val)) = prog.parallel_search(&slots, s, width) {
+            // Start a timeout thread that sets cancelled after solve_timeout_s
+            let cancelled = self.cancelled.clone();
+            let timeout_s = self.solve_timeout_s;
+            if timeout_s > 0.0 {
+                let c = cancelled.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs_f64(timeout_s));
+                    c.store(true, Ordering::Relaxed);
+                });
+            }
+
+            if let Some((slot_vals, val)) = prog.parallel_search(&slots, s, width, &cancelled) {
                 // Record witness
                 for &(var_id, slot_idx, _) in &slots {
                     self.witness.insert(var_id, slot_vals[slot_idx as usize]);
@@ -630,7 +679,19 @@ impl<'a> SolverContext<'a> {
         }
 
         // Iterative enumeration using counter increment
+        let mut iter_count: u64 = 0;
         loop {
+            iter_count += 1;
+            if iter_count.is_multiple_of(100_000) && self.solve_timeout_s > 0.0
+               && self.start_time.elapsed().as_secs_f64() > self.solve_timeout_s {
+                // Timed out — return a non-ground terminal to signal Unknown
+                use crate::bvc::BvcEntry;
+                let timeout_bvc = self.bm.alloc(width, vec![BvcEntry {
+                    term: self.tt.make_const(0, width),
+                    constraint: self.ct.true_id(),
+                }]);
+                return self.mgr.make_terminal(timeout_bvc, true, false);
+            }
             let val = prog.eval_packed(slot_vals, regs);
             let check_val = mask_for_check(val, width);
             if s.contains(check_val) {

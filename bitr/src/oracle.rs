@@ -237,6 +237,28 @@ impl SmtOracle {
     }
 }
 
+/// Run the solver directly on an SMT-LIB2 file (no translation needed)
+pub fn solve_smtlib2_file(solver_path: &str, file_path: &str) -> SolveResult {
+    let result = Command::new(solver_path)
+        .arg(file_path)
+        .output();
+
+    match result {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let trimmed = stdout.trim();
+            if trimmed.starts_with("sat") {
+                SolveResult::Sat
+            } else if trimmed.starts_with("unsat") {
+                SolveResult::Unsat
+            } else {
+                SolveResult::Unknown
+            }
+        }
+        Err(_) => SolveResult::Unknown,
+    }
+}
+
 /// Try to find an available SMT solver
 pub fn find_solver() -> Option<String> {
     for solver in &["bitwuzla", "boolector", "z3"] {

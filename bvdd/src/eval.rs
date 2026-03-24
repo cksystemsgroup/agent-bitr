@@ -4,6 +4,7 @@
 //! for ~10x faster evaluation in generalized blast inner loops.
 //! Each term maps to a register; instructions execute in topological order.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use crate::types::{TermId, OpKind, BvWidth};
 use crate::term::{TermTable, TermKind};
 use crate::valueset::ValueSet;
@@ -283,6 +284,7 @@ impl CompiledProgram {
         slots: &[(u32, u32, u64)],
         target: ValueSet,
         result_width: BvWidth,
+        cancelled: &AtomicBool,
     ) -> Option<(Vec<u64>, u64)> {
         use rayon::prelude::*;
 
@@ -311,6 +313,7 @@ impl CompiledProgram {
             let mut regs = vec![0u64; self.num_regs as usize];
 
             for outer_val in start..end {
+                if cancelled.load(Ordering::Relaxed) { return None; }
                 slot_vals[outer_slot as usize] = outer_val;
 
                 if inner_slots.is_empty() {
