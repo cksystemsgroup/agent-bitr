@@ -148,6 +148,12 @@ pub fn parse_smtlib2(input: &str) -> Result<SmtModel, String> {
     let mut defines: HashMap<String, BvcId> = HashMap::new();
     // Parameterized function definitions: name → (params, body)
     let mut fun_defs: HashMap<String, (Vec<(String, SmtSort)>, Sexp)> = HashMap::new();
+    // Array variables: name → (var_id, index_width, element_width)
+    let mut array_vars: HashMap<String, (u32, BvWidth, BvWidth)> = HashMap::new();
+    // Array expressions for ROW expansion: name → ArrayExpr
+    let mut array_exprs: HashMap<String, ArrayExpr> = HashMap::new();
+    // Array define-fun bodies (stored as S-expressions for lazy expansion)
+    let mut array_defines: HashMap<String, Sexp> = HashMap::new();
 
     while let Some(sexp) = parse_sexp(&mut tok) {
         if let Sexp::List(items) = &sexp {
@@ -159,28 +165,24 @@ pub fn parse_smtlib2(input: &str) -> Result<SmtModel, String> {
                         // Ignore
                     }
                     "declare-const" => {
-                        // (declare-const name sort)
                         if items.len() >= 3 {
                             let name = atom_str(&items[1]);
                             let sort = parse_sort(&items[2])?;
-                            if let SmtSort::BitVec(w) = sort {
-                                let vid = next_var; next_var += 1;
-                                var_ids.insert(name.clone(), (vid, w));
-                                let bvc = model.bm.make_input(&mut model.tt, &model.ct, vid, w);
-                                model.var_map.insert(name, bvc);
+                            declare_var(&sort, &name, &mut next_var, &mut var_ids,
+                                &mut array_vars, &mut model, &mut defines);
+                            if let Some(&(vid, iw, ew)) = array_vars.get(&name) {
+                                array_exprs.insert(name, ArrayExpr::Base { var_id: vid, index_width: iw, element_width: ew });
                             }
                         }
                     }
                     "declare-fun" => {
-                        // (declare-fun name () sort)
                         if items.len() >= 4 {
                             let name = atom_str(&items[1]);
                             let sort = parse_sort(&items[items.len() - 1])?;
-                            if let SmtSort::BitVec(w) = sort {
-                                let vid = next_var; next_var += 1;
-                                var_ids.insert(name.clone(), (vid, w));
-                                let bvc = model.bm.make_input(&mut model.tt, &model.ct, vid, w);
-                                model.var_map.insert(name, bvc);
+                            declare_var(&sort, &name, &mut next_var, &mut var_ids,
+                                &mut array_vars, &mut model, &mut defines);
+                            if let Some(&(vid, iw, ew)) = array_vars.get(&name) {
+                                array_exprs.insert(name, ArrayExpr::Base { var_id: vid, index_width: iw, element_width: ew });
                             }
                         }
                     }
@@ -206,13 +208,29 @@ pub fn parse_smtlib2(input: &str) -> Result<SmtModel, String> {
                             }
 
                             if params.is_empty() {
-                                // Zero-arg: evaluate immediately
-                                let bvc = translate_expr(
-                                    &body, &mut model.tt, &mut model.ct, &mut model.bm,
-                                    &model.var_map, &var_ids, &defines, &fun_defs,
-                                )?;
-                                defines.insert(name.clone(), bvc);
-                                model.var_map.insert(name, bvc);
+                                // Check if the return sort is an array
+                                let ret_sort = parse_sort(&items[items.len() - 2]).ok();
+                                let is_array = matches!(ret_sort, Some(SmtSort::Array(_, _)));
+
+                                if is_array {
+                                    // Array-returning: eagerly expand body into ArrayExpr
+                                    array_defines.insert(name.clone(), body.clone());
+                                    if let Ok(expr) = build_array_expr(
+                                        &body, &mut model.tt, &mut model.ct, &mut model.bm,
+                                        &model.var_map, &var_ids, &defines, &fun_defs, &array_vars,
+                                        &array_defines,
+                                    ) {
+                                        array_exprs.insert(name, expr);
+                                    }
+                                } else {
+                                    // BV-returning: evaluate immediately
+                                    let bvc = translate_expr(
+                                        &body, &mut model.tt, &mut model.ct, &mut model.bm,
+                                        &model.var_map, &var_ids, &defines, &fun_defs, &array_vars,
+                                    )?;
+                                    defines.insert(name.clone(), bvc);
+                                    model.var_map.insert(name, bvc);
+                                }
                             } else {
                                 // Parameterized: store as template
                                 fun_defs.insert(name, (params, body));
@@ -221,9 +239,11 @@ pub fn parse_smtlib2(input: &str) -> Result<SmtModel, String> {
                     }
                     "assert" => {
                         if items.len() >= 2 {
+                            // Pre-expand array define-fun names in the assertion
+                            let expanded = expand_array_names(&items[1], &array_defines);
                             let bvc = translate_expr(
-                                &items[1], &mut model.tt, &mut model.ct, &mut model.bm,
-                                &model.var_map, &var_ids, &defines, &fun_defs,
+                                &expanded, &mut model.tt, &mut model.ct, &mut model.bm,
+                                &model.var_map, &var_ids, &defines, &fun_defs, &array_vars,
                             )?;
                             model.assertions.push(bvc);
                         }
@@ -280,8 +300,171 @@ fn parse_sort(sexp: &Sexp) -> Result<SmtSort, String> {
     }
 }
 
+/// Array expression for ROW expansion
+#[derive(Clone, Debug)]
+enum ArrayExpr {
+    /// Base array variable
+    Base { var_id: u32, index_width: BvWidth, element_width: BvWidth },
+    /// Store: store(base, index, value)
+    Store { base: Box<ArrayExpr>, idx_bvc: BvcId, val_bvc: BvcId, element_width: BvWidth },
+}
+
+/// Expand a select from an array expression using ROW (Read-Over-Write)
+fn expand_select_row(
+    arr: &ArrayExpr,
+    read_idx_bvc: BvcId,
+    tt: &mut TermTable,
+    ct: &mut ConstraintTable,
+    bm: &mut BvcManager,
+) -> BvcId {
+    match arr {
+        ArrayExpr::Base { var_id, index_width, element_width } => {
+            // Read from base: unconstrained (symbolic)
+            let arr_term = tt.make_var(*var_id, *index_width);
+            let idx_term = bm.get(read_idx_bvc).entries[0].term;
+            let read_term = tt.make_app(OpKind::Read, vec![arr_term, idx_term], *element_width);
+            bm.alloc(*element_width, vec![BvcEntry { term: read_term, constraint: ct.true_id() }])
+        }
+        ArrayExpr::Store { base, idx_bvc, val_bvc, element_width } => {
+            // ROW: ITE(EQ(read_idx, write_idx), write_val, select(base, read_idx))
+            let r_term = bm.get(read_idx_bvc).entries[0].term;
+            let w_idx_term = bm.get(*idx_bvc).entries[0].term;
+            let w_val_term = bm.get(*val_bvc).entries[0].term;
+
+            let eq = tt.make_app(OpKind::Eq, vec![r_term, w_idx_term], 1);
+            let base_read = expand_select_row(base, read_idx_bvc, tt, ct, bm);
+            let base_term = bm.get(base_read).entries[0].term;
+
+            let ite = tt.make_app(OpKind::Ite, vec![eq, w_val_term, base_term], *element_width);
+            bm.alloc(*element_width, vec![BvcEntry { term: ite, constraint: ct.true_id() }])
+        }
+    }
+}
+
+/// Helper: declare a variable of any sort
+fn declare_var(
+    sort: &SmtSort,
+    name: &str,
+    next_var: &mut u32,
+    var_ids: &mut HashMap<String, (u32, BvWidth)>,
+    array_vars: &mut HashMap<String, (u32, BvWidth, BvWidth)>,
+    model: &mut SmtModel,
+    _defines: &mut HashMap<String, BvcId>,
+) {
+    match sort {
+        SmtSort::BitVec(w) => {
+            let vid = *next_var; *next_var += 1;
+            var_ids.insert(name.to_string(), (vid, *w));
+            let bvc = model.bm.make_input(&mut model.tt, &model.ct, vid, *w);
+            model.var_map.insert(name.to_string(), bvc);
+        }
+        SmtSort::Bool => {
+            let vid = *next_var; *next_var += 1;
+            var_ids.insert(name.to_string(), (vid, 1));
+            let bvc = model.bm.make_input(&mut model.tt, &model.ct, vid, 1);
+            model.var_map.insert(name.to_string(), bvc);
+        }
+        SmtSort::Array(idx_sort, elem_sort) => {
+            if let (SmtSort::BitVec(iw), SmtSort::BitVec(ew)) = (idx_sort.as_ref(), elem_sort.as_ref()) {
+                let vid = *next_var; *next_var += 1;
+                array_vars.insert(name.to_string(), (vid, *iw, *ew));
+            }
+            // Note: array_exprs populated elsewhere (in parse_smtlib2 after declare_var)
+        }
+    }
+}
+
+/// Substitute array define-fun names with their bodies in an S-expression (recursive)
+fn expand_array_names(sexp: &Sexp, array_defines: &HashMap<String, Sexp>) -> Sexp {
+    match sexp {
+        Sexp::Atom(name) => {
+            if let Some(body) = array_defines.get(name.as_str()) {
+                // Recursively expand in case body references other array defines
+                expand_array_names(body, array_defines)
+            } else {
+                sexp.clone()
+            }
+        }
+        Sexp::List(items) => {
+            Sexp::List(items.iter().map(|s| expand_array_names(s, array_defines)).collect())
+        }
+    }
+}
+
+/// Parse a store expression, returning a BVC that represents the stored array
+/// (the actual expansion happens at select time via ROW)
+#[allow(clippy::too_many_arguments)]
+fn translate_store(
+    args: &[Sexp],
+    tt: &mut TermTable, ct: &mut ConstraintTable, bm: &mut BvcManager,
+    var_map: &HashMap<String, BvcId>, var_ids: &HashMap<String, (u32, BvWidth)>,
+    defines: &HashMap<String, BvcId>, fun_defs: &FunDefs, array_vars: &ArrayVars,
+) -> Result<BvcId, String> {
+    // For store, we need to return something the caller can use.
+    // Since store returns an array (not a bitvector), we create a sentinel BVC.
+    // The actual ROW expansion happens when select is called on this store result.
+    // For now, create a dummy 8-bit BVC — the select handler will rebuild from sexp.
+    let idx_bvc = translate_expr(&args[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+    let val_bvc = translate_expr(&args[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+    let ew = bm.get(val_bvc).width;
+
+    // Build a Write term (for oracle fallback)
+    let idx_term = bm.get(idx_bvc).entries[0].term;
+    let val_term = bm.get(val_bvc).entries[0].term;
+
+    // Try to get the base array
+    let arr_name = atom_str(&args[0]);
+    let arr_term = if let Some(&(vid, iw, _)) = array_vars.get(&arr_name) {
+        tt.make_var(vid, iw)
+    } else {
+        tt.make_const(0, 8) // placeholder
+    };
+
+    let write_term = tt.make_app(OpKind::Write, vec![arr_term, idx_term, val_term], ew);
+    Ok(bm.alloc(ew, vec![BvcEntry { term: write_term, constraint: ct.true_id() }]))
+}
+
+/// Build an ArrayExpr tree from an S-expression (for ROW expansion at select time)
+#[allow(clippy::too_many_arguments)]
+fn build_array_expr(
+    sexp: &Sexp,
+    tt: &mut TermTable, ct: &mut ConstraintTable, bm: &mut BvcManager,
+    var_map: &HashMap<String, BvcId>, var_ids: &HashMap<String, (u32, BvWidth)>,
+    defines: &HashMap<String, BvcId>, fun_defs: &FunDefs, array_vars: &ArrayVars,
+    array_defines: &HashMap<String, Sexp>,
+) -> Result<ArrayExpr, String> {
+    match sexp {
+        Sexp::Atom(name) => {
+            if let Some(&(vid, iw, ew)) = array_vars.get(name.as_str()) {
+                Ok(ArrayExpr::Base { var_id: vid, index_width: iw, element_width: ew })
+            } else if let Some(body) = array_defines.get(name.as_str()) {
+                // Expand the define-fun body
+                let body = body.clone();
+                build_array_expr(&body, tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars, array_defines)
+            } else {
+                Err(format!("unknown array: {}", name))
+            }
+        }
+        Sexp::List(items) => {
+            if items.is_empty() { return Err("empty array expression".into()); }
+            let head = atom_str(&items[0]);
+            if head == "store" && items.len() >= 4 {
+                let base = build_array_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars, array_defines)?;
+                let idx_bvc = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                let val_bvc = translate_expr(&items[3], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                let ew = bm.get(val_bvc).width;
+                Ok(ArrayExpr::Store { base: Box::new(base), idx_bvc, val_bvc, element_width: ew })
+            } else {
+                Err(format!("unsupported array expression: {}", head))
+            }
+        }
+    }
+}
+
 /// Type alias for parameterized function definitions
 type FunDefs = HashMap<String, (Vec<(String, SmtSort)>, Sexp)>;
+/// Type alias for array variable info
+type ArrayVars = HashMap<String, (u32, BvWidth, BvWidth)>;
 
 /// Translate an SMT-LIB2 expression to a BVC
 #[allow(clippy::too_many_arguments)]
@@ -294,6 +477,7 @@ fn translate_expr(
     var_ids: &HashMap<String, (u32, BvWidth)>,
     defines: &HashMap<String, BvcId>,
     fun_defs: &FunDefs,
+    array_vars: &ArrayVars,
 ) -> Result<BvcId, String> {
     match sexp {
         Sexp::Atom(s) => {
@@ -356,7 +540,7 @@ fn translate_expr(
                     for (i, (pname, psort)) in params.iter().enumerate() {
                         let arg_bvc = translate_expr(
                             &items[i + 1], tt, ct, bm,
-                            &local_var_map, &local_var_ids, &local_defines, fun_defs,
+                            &local_var_map, &local_var_ids, &local_defines, fun_defs, array_vars,
                         )?;
                         local_defines.insert(pname.clone(), arg_bvc);
                         local_var_map.insert(pname.clone(), arg_bvc);
@@ -367,7 +551,7 @@ fn translate_expr(
                     }
                     return translate_expr(
                         body, tt, ct, bm,
-                        &local_var_map, &local_var_ids, &local_defines, fun_defs,
+                        &local_var_map, &local_var_ids, &local_defines, fun_defs, array_vars,
                     );
                 }
             }
@@ -390,7 +574,7 @@ fn translate_expr(
                             let op_name = atom_str(&inner[1]);
                             return translate_indexed_op(
                                 &op_name, inner, &items[1..],
-                                tt, ct, bm, var_map, var_ids, defines, fun_defs,
+                                tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars,
                             );
                         }
                     }
@@ -400,7 +584,7 @@ fn translate_expr(
             // Regular operators
             match head.as_str() {
                 "not" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     let w = bm.get(a).width;
                     if w == 1 {
                         // Boolean not → bitvector NOT at width 1
@@ -409,107 +593,131 @@ fn translate_expr(
                         Ok(bm.apply(tt, ct, OpKind::Not, &[a], w))
                     }
                 }
-                "and" => translate_nary(OpKind::And, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
-                "or" => translate_nary(OpKind::Or, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
+                "and" => translate_nary(OpKind::And, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
+                "or" => translate_nary(OpKind::Or, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
                 "xor" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     let w = bm.get(a).width;
                     Ok(bm.apply(tt, ct, OpKind::Xor, &[a, b], w))
                 }
                 "=" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     Ok(bm.apply(tt, ct, OpKind::Eq, &[a, b], 1))
                 }
                 "distinct" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     Ok(bm.apply(tt, ct, OpKind::Neq, &[a, b], 1))
                 }
                 "ite" => {
-                    let c = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let t = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let e = translate_expr(&items[3], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let c = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let t = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let e = translate_expr(&items[3], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     let w = bm.get(t).width;
                     Ok(bm.apply(tt, ct, OpKind::Ite, &[c, t, e], w))
                 }
-                "bvand" => translate_binop(OpKind::And, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
-                "bvor" => translate_binop(OpKind::Or, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
-                "bvxor" => translate_binop(OpKind::Xor, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
+                "bvand" => translate_binop(OpKind::And, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
+                "bvor" => translate_binop(OpKind::Or, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
+                "bvxor" => translate_binop(OpKind::Xor, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
                 "bvnot" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     let w = bm.get(a).width;
                     Ok(bm.apply(tt, ct, OpKind::Not, &[a], w))
                 }
                 "bvneg" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     let w = bm.get(a).width;
                     Ok(bm.apply(tt, ct, OpKind::Neg, &[a], w))
                 }
-                "bvadd" => translate_binop(OpKind::Add, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
-                "bvsub" => translate_binop(OpKind::Sub, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
-                "bvmul" => translate_binop(OpKind::Mul, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
-                "bvudiv" => translate_binop(OpKind::Udiv, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
-                "bvurem" => translate_binop(OpKind::Urem, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
-                "bvsdiv" => translate_binop(OpKind::Sdiv, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
-                "bvsrem" => translate_binop(OpKind::Srem, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
-                "bvsmod" => translate_binop(OpKind::Smod, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
-                "bvshl" => translate_binop(OpKind::Sll, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
-                "bvlshr" => translate_binop(OpKind::Srl, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
-                "bvashr" => translate_binop(OpKind::Sra, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs),
+                "bvadd" => translate_binop(OpKind::Add, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
+                "bvsub" => translate_binop(OpKind::Sub, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
+                "bvmul" => translate_binop(OpKind::Mul, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
+                "bvudiv" => translate_binop(OpKind::Udiv, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
+                "bvurem" => translate_binop(OpKind::Urem, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
+                "bvsdiv" => translate_binop(OpKind::Sdiv, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
+                "bvsrem" => translate_binop(OpKind::Srem, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
+                "bvsmod" => translate_binop(OpKind::Smod, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
+                "bvshl" => translate_binop(OpKind::Sll, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
+                "bvlshr" => translate_binop(OpKind::Srl, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
+                "bvashr" => translate_binop(OpKind::Sra, &items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars),
                 "bvult" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     Ok(bm.apply(tt, ct, OpKind::Ult, &[a, b], 1))
                 }
                 "bvule" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     Ok(bm.apply(tt, ct, OpKind::Ulte, &[a, b], 1))
                 }
                 "bvslt" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     Ok(bm.apply(tt, ct, OpKind::Slt, &[a, b], 1))
                 }
                 "bvsle" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     Ok(bm.apply(tt, ct, OpKind::Slte, &[a, b], 1))
                 }
                 "bvugt" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     Ok(bm.apply(tt, ct, OpKind::Ult, &[b, a], 1))
                 }
                 "bvuge" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     Ok(bm.apply(tt, ct, OpKind::Ulte, &[b, a], 1))
                 }
                 "bvsgt" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     Ok(bm.apply(tt, ct, OpKind::Slt, &[b, a], 1))
                 }
                 "bvsge" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     Ok(bm.apply(tt, ct, OpKind::Slte, &[b, a], 1))
                 }
                 "concat" => {
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     let wa = bm.get(a).width;
                     let wb = bm.get(b).width;
                     Ok(bm.apply(tt, ct, OpKind::Concat, &[a, b], wa + wb))
                 }
                 "bvcomp" => {
-                    // (bvcomp a b) returns #b1 if a==b, #b0 otherwise
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     Ok(bm.apply(tt, ct, OpKind::Eq, &[a, b], 1))
+                }
+                // Array operations — use ROW expansion
+                "select" => {
+                    let idx_bvc = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let empty_ad = HashMap::new();
+                    match build_array_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars, &empty_ad) {
+                        Ok(arr_expr) => Ok(expand_select_row(&arr_expr, idx_bvc, tt, ct, bm)),
+                        Err(_) => {
+                            // Fallback: build Read term for oracle
+                            let idx_term = bm.get(idx_bvc).entries[0].term;
+                            // Try to find a fresh variable for this array read
+                            let arr_name = atom_str(&items[1]);
+                            if let Some(&(vid, iw, ew)) = array_vars.get(&arr_name) {
+                                let arr_term = tt.make_var(vid, iw);
+                                let read_term = tt.make_app(OpKind::Read, vec![arr_term, idx_term], ew);
+                                Ok(bm.alloc(ew, vec![BvcEntry { term: read_term, constraint: ct.true_id() }]))
+                            } else {
+                                // Unknown array — oracle fallback
+                                Ok(bm.make_const(tt, ct, 0, 8))
+                            }
+                        }
+                    }
+                }
+                "store" => {
+                    translate_store(&items[1..], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)
                 }
                 "let" => {
                     // (let ((x expr) ...) body)
@@ -523,7 +731,7 @@ fn translate_expr(
                                         let name = atom_str(&pair[0]);
                                         let val = translate_expr(
                                             &pair[1], tt, ct, bm,
-                                            &local_var_map, var_ids, &local_defines, fun_defs,
+                                            &local_var_map, var_ids, &local_defines, fun_defs, array_vars,
                                         )?;
                                         local_defines.insert(name.clone(), val);
                                         local_var_map.insert(name, val);
@@ -533,7 +741,7 @@ fn translate_expr(
                         }
                         translate_expr(
                             &items[2], tt, ct, bm,
-                            &local_var_map, var_ids, &local_defines, fun_defs,
+                            &local_var_map, var_ids, &local_defines, fun_defs, array_vars,
                         )
                     } else {
                         Err("malformed let".into())
@@ -541,8 +749,8 @@ fn translate_expr(
                 }
                 "=>" => {
                     // implies
-                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+                    let a = translate_expr(&items[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+                    let b = translate_expr(&items[2], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
                     let not_a = bm.apply(tt, ct, OpKind::Not, &[a], 1);
                     Ok(bm.apply(tt, ct, OpKind::Or, &[not_a, b], 1))
                 }
@@ -565,12 +773,13 @@ fn translate_indexed_op(
     var_ids: &HashMap<String, (u32, BvWidth)>,
     defines: &HashMap<String, BvcId>,
     fun_defs: &FunDefs,
+    array_vars: &ArrayVars,
 ) -> Result<BvcId, String> {
     match op_name {
         "extract" => {
             let upper: u16 = atom_str(&inner[2]).parse().unwrap_or(0);
             let lower: u16 = atom_str(&inner[3]).parse().unwrap_or(0);
-            let a = translate_expr(&args[0], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+            let a = translate_expr(&args[0], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
             let arg_term = bm.get(a).entries[0].term;
             let slice_term = tt.make_slice(arg_term, upper, lower);
             let constraint = bm.get(a).entries[0].constraint;
@@ -579,7 +788,7 @@ fn translate_indexed_op(
         }
         "zero_extend" => {
             let ext: u16 = atom_str(&inner[2]).parse().unwrap_or(0);
-            let a = translate_expr(&args[0], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+            let a = translate_expr(&args[0], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
             let wa = bm.get(a).width;
             let new_width = wa + ext;
             let arg_term = bm.get(a).entries[0].term;
@@ -589,7 +798,7 @@ fn translate_indexed_op(
         }
         "sign_extend" => {
             let ext: u16 = atom_str(&inner[2]).parse().unwrap_or(0);
-            let a = translate_expr(&args[0], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+            let a = translate_expr(&args[0], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
             let wa = bm.get(a).width;
             let new_width = wa + ext;
             let arg_term = bm.get(a).entries[0].term;
@@ -599,7 +808,7 @@ fn translate_indexed_op(
         }
         "repeat" => {
             let count: u16 = atom_str(&inner[2]).parse().unwrap_or(1);
-            let a = translate_expr(&args[0], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+            let a = translate_expr(&args[0], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
             let wa = bm.get(a).width;
             let mut result = a;
             for _ in 1..count {
@@ -610,7 +819,7 @@ fn translate_indexed_op(
         "rotate_left" | "rotate_right" => {
             // Approximation: treat as shift (correct for many benchmarks)
             let _amount: u16 = atom_str(&inner[2]).parse().unwrap_or(0);
-            let a = translate_expr(&args[0], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+            let a = translate_expr(&args[0], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
             Ok(a) // TODO: proper rotation
         }
         _ => Err(format!("unsupported indexed op: {}", op_name)),
@@ -628,9 +837,10 @@ fn translate_binop(
     var_ids: &HashMap<String, (u32, BvWidth)>,
     defines: &HashMap<String, BvcId>,
     fun_defs: &FunDefs,
+    array_vars: &ArrayVars,
 ) -> Result<BvcId, String> {
-    let a = translate_expr(&args[0], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
-    let b = translate_expr(&args[1], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+    let a = translate_expr(&args[0], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
+    let b = translate_expr(&args[1], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
     let w = bm.get(a).width;
     Ok(bm.apply(tt, ct, op, &[a, b], w))
 }
@@ -646,13 +856,14 @@ fn translate_nary(
     var_ids: &HashMap<String, (u32, BvWidth)>,
     defines: &HashMap<String, BvcId>,
     fun_defs: &FunDefs,
+    array_vars: &ArrayVars,
 ) -> Result<BvcId, String> {
     if args.is_empty() {
         return Err("empty n-ary op".into());
     }
-    let mut result = translate_expr(&args[0], tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+    let mut result = translate_expr(&args[0], tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
     for arg in &args[1..] {
-        let b = translate_expr(arg, tt, ct, bm, var_map, var_ids, defines, fun_defs)?;
+        let b = translate_expr(arg, tt, ct, bm, var_map, var_ids, defines, fun_defs, array_vars)?;
         let w = bm.get(result).width;
         result = bm.apply(tt, ct, op, &[result, b], w);
     }
