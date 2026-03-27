@@ -264,7 +264,7 @@ fn solve_btor2(
             bmc::StateVar { nid, width, init_bvc: init, next_bvc: next }
         }).collect();
 
-        let bmc_config = bmc::BmcConfig {
+        let _bmc_config = bmc::BmcConfig {
             max_bound,
             timeout_s,
             verbose,
@@ -273,6 +273,11 @@ fn solve_btor2(
             .map(|&(nid, width)| bmc::InputVar { nid, width })
             .collect();
 
+        let bmc_config = bmc::BmcConfig {
+            max_bound,
+            timeout_s,
+            verbose,
+        };
         bmc::bmc_check(
             &bmc_config,
             &mut lifted.tt,

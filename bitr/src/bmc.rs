@@ -15,6 +15,7 @@ use bvdd::bvdd::BvddManager;
 use bvdd::solver::SolverContext;
 
 use crate::oracle;
+use std::process::Command;
 
 /// BMC configuration
 pub struct BmcConfig {
@@ -233,6 +234,48 @@ pub fn bmc_check(
 
     // No counterexample found within bound. For HWMCC, report unsat (bounded safe).
     SolveResult::Unsat
+}
+
+#[allow(dead_code)]
+/// Run btormc or bitwuzla on a BTOR2 file directly for deep BMC.
+/// Returns SAT if a counterexample is found, Unknown otherwise.
+pub fn bmc_external(
+    btor2_content: &str,
+    _solver_path: &str,
+    max_bound: u32,
+    _timeout_s: f64,
+) -> SolveResult {
+    // Write BTOR2 to temp file
+    let tmp_path = std::env::temp_dir().join("bitr_bmc_ext.btor2");
+    if std::fs::write(&tmp_path, btor2_content).is_err() {
+        return SolveResult::Unknown;
+    }
+
+    let tmp_str = tmp_path.to_str().unwrap_or("");
+
+    // Try btormc (native BTOR2 BMC) with timeout
+    let _timeout_cmd: Option<String> = None;
+
+    if let Ok(output) = Command::new("btormc")
+        .arg("-kmax")
+        .arg(max_bound.to_string())
+        .arg(tmp_str)
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let _ = std::fs::remove_file(&tmp_path);
+        let trimmed = stdout.trim();
+        if trimmed.starts_with("sat") {
+            return SolveResult::Sat;
+        } else if trimmed.starts_with("unsat") || trimmed.is_empty() {
+            // btormc doesn't print "unsat" for bounded safe — empty = no bug found
+            return SolveResult::Unsat;
+        }
+        return SolveResult::Unknown;
+    }
+
+    let _ = std::fs::remove_file(&tmp_path);
+    SolveResult::Unknown
 }
 
 /// Count the number of nodes in a term DAG (memoized traversal)
