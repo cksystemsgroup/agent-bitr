@@ -15,7 +15,6 @@ use bvdd::bvdd::BvddManager;
 use bvdd::solver::SolverContext;
 
 use crate::oracle;
-use std::process::Command;
 
 /// BMC configuration
 pub struct BmcConfig {
@@ -98,6 +97,18 @@ pub fn bmc_check(
                         set.insert(v);
                     }
                 }
+            }
+        }
+        set
+    };
+
+    // Detect inputs used as ITE conditions in next-state (likely reset signals)
+    let inputs_as_ite_cond: std::collections::HashSet<u32> = {
+        let mut set = std::collections::HashSet::new();
+        for sv in states {
+            if let Some(next_bvc) = sv.next_bvc {
+                let term = bm.get(next_bvc).entries[0].term;
+                collect_ite_cond_inputs(tt, term, &inputs_in_next, &mut set);
             }
         }
         set
@@ -199,13 +210,23 @@ pub fn bmc_check(
             break;
         }
 
-        // Create fresh input variables only for inputs used in next-state functions
+        // Create fresh input variables for inputs in next-state functions
         let mut input_rename: HashMap<u32, BvcId> = HashMap::new();
         for iv in inputs {
             if inputs_in_next.contains(&iv.nid) {
-                let fresh_id = bm.fresh_var();
-                let fresh_bvc = bm.make_input(tt, ct, fresh_id, iv.width);
-                input_rename.insert(iv.nid, fresh_bvc);
+                // Check if this input is used as an ITE condition in next-state
+                // (pattern: ite(input, init_val, compute) — likely a reset signal)
+                let is_ite_cond = inputs_as_ite_cond.contains(&iv.nid);
+                if is_ite_cond && iv.width == 1 {
+                    // Reset signal: set to 0 (no reset) for steps > 0
+                    let const_bvc = bm.make_const(tt, ct, 0, 1);
+                    input_rename.insert(iv.nid, const_bvc);
+                } else {
+                    // Data input: create fresh variable
+                    let fresh_id = bm.fresh_var();
+                    let fresh_bvc = bm.make_input(tt, ct, fresh_id, iv.width);
+                    input_rename.insert(iv.nid, fresh_bvc);
+                }
             }
         }
 
@@ -236,46 +257,29 @@ pub fn bmc_check(
     SolveResult::Unsat
 }
 
-#[allow(dead_code)]
-/// Run btormc or bitwuzla on a BTOR2 file directly for deep BMC.
-/// Returns SAT if a counterexample is found, Unknown otherwise.
-pub fn bmc_external(
-    btor2_content: &str,
-    _solver_path: &str,
-    max_bound: u32,
-    _timeout_s: f64,
-) -> SolveResult {
-    // Write BTOR2 to temp file
-    let tmp_path = std::env::temp_dir().join("bitr_bmc_ext.btor2");
-    if std::fs::write(&tmp_path, btor2_content).is_err() {
-        return SolveResult::Unknown;
-    }
-
-    let tmp_str = tmp_path.to_str().unwrap_or("");
-
-    // Try btormc (native BTOR2 BMC) with timeout
-    let _timeout_cmd: Option<String> = None;
-
-    if let Ok(output) = Command::new("btormc")
-        .arg("-kmax")
-        .arg(max_bound.to_string())
-        .arg(tmp_str)
-        .output()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let _ = std::fs::remove_file(&tmp_path);
-        let trimmed = stdout.trim();
-        if trimmed.starts_with("sat") {
-            return SolveResult::Sat;
-        } else if trimmed.starts_with("unsat") || trimmed.is_empty() {
-            // btormc doesn't print "unsat" for bounded safe — empty = no bug found
-            return SolveResult::Unsat;
+/// Find input variables used as ITE conditions in a term (likely reset signals)
+fn collect_ite_cond_inputs(
+    tt: &TermTable,
+    term: TermId,
+    input_nids: &std::collections::HashSet<u32>,
+    result: &mut std::collections::HashSet<u32>,
+) {
+    match &tt.get(term).kind {
+        TermKind::Const(_) | TermKind::Var(_) => {}
+        TermKind::App { op, args, .. } => {
+            if *op == bvdd::types::OpKind::Ite && !args.is_empty() {
+                // Check if the condition (first arg) is an input variable
+                if let TermKind::Var(v) = &tt.get(args[0]).kind {
+                    if input_nids.contains(v) {
+                        result.insert(*v);
+                    }
+                }
+            }
+            for &arg in args {
+                collect_ite_cond_inputs(tt, arg, input_nids, result);
+            }
         }
-        return SolveResult::Unknown;
     }
-
-    let _ = std::fs::remove_file(&tmp_path);
-    SolveResult::Unknown
 }
 
 /// Count the number of nodes in a term DAG (memoized traversal)
