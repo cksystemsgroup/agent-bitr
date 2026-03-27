@@ -134,10 +134,8 @@ pub fn bmc_check(
 
             let is_ground = bm.is_ground(tt, resolved_bvc);
 
-            // If term is small enough, use the BVDD solver
-            // If too large, try the SMT oracle directly
-            // Try BVDD solver first (fast for small terms)
-            let mut result = if term_size <= 50_000 {
+            // Use BVDD solver for manageable terms, oracle for very large ones
+            let mut result = if term_size <= 10_000 {
                 let terminal = mgr.make_terminal(resolved_bvc, true, is_ground);
                 let mut ctx = SolverContext::new(tt, ct, bm, &mut mgr);
                 if let Some(ref mut oracle) = smt_oracle {
@@ -157,7 +155,6 @@ pub fn bmc_check(
             };
 
             // Only use oracle for very large terms where BVDD is hopeless
-            // (oracle calls take ~5s each, so use sparingly)
             if result == SolveResult::Unknown && term_size > 50_000 {
                 if let Some(ref mut oracle) = smt_oracle {
                     let width = bm.get(resolved_bvc).width;
