@@ -1,6 +1,49 @@
 use crate::types::{BvcId, TermId, ConstraintId, BvWidth, OpKind};
 use crate::term::{TermTable, TermKind};
 use crate::constraint::ConstraintTable;
+use crate::valueset::ValueSet;
+
+/// Compute the value set of domain values `d` that make `op(d, const_val)` true.
+/// If `swapped`, computes for `op(const_val, d)` instead.
+fn compute_comparison_valueset(op: OpKind, const_val: u64, width: BvWidth, swapped: bool) -> ValueSet {
+    let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+    let cv = const_val & mask;
+
+    ValueSet::from_fn(|d| {
+        let dv = (d as u64) & mask;
+        let (a, b) = if swapped { (cv, dv) } else { (dv, cv) };
+
+        match op {
+            OpKind::Eq => a == b,
+            OpKind::Neq => a != b,
+            OpKind::Ult => a < b,
+            OpKind::Ulte => a <= b,
+            OpKind::Slt => {
+                let sa = sign_ext(a, width);
+                let sb = sign_ext(b, width);
+                sa < sb
+            }
+            OpKind::Slte => {
+                let sa = sign_ext(a, width);
+                let sb = sign_ext(b, width);
+                sa <= sb
+            }
+            _ => true, // For non-comparison ops, don't constrain
+        }
+    })
+}
+
+/// Sign-extend for comparison value set computation
+fn sign_ext(val: u64, width: BvWidth) -> i64 {
+    if width == 0 { return 0; }
+    if width >= 64 { return val as i64; }
+    let sign_bit = 1u64 << (width - 1);
+    if val & sign_bit != 0 {
+        (val | !((1u64 << width) - 1)) as i64
+    } else {
+        val as i64
+    }
+}
 
 /// A single BVC entry: (term, constraint)
 #[derive(Debug, Clone)]
@@ -93,9 +136,10 @@ impl BvcManager {
 
     /// Apply a structural operator: keeps the actual operator term.
     ///
-    /// For structural ops (comparisons, Boolean at width 1), the result
-    /// BVC has the operator application as its term, with operand constraints
-    /// propagated. Theory resolution can then evaluate the expression directly.
+    /// For comparisons (EQ, ULT, etc.) where one operand is a narrow BVC
+    /// (≤8 bits), generates PRED constraints to enable Decide/Restrict
+    /// interval blasting. The PRED asserts which values the operand can
+    /// take to make the comparison true.
     pub fn apply_structural(
         &mut self,
         tt: &mut TermTable,
@@ -117,6 +161,43 @@ impl BvcManager {
         for &bvc_id in operands {
             let entry_constraint = self.get(bvc_id).entries[0].constraint;
             combined_constraint = ct.make_and(combined_constraint, entry_constraint);
+        }
+
+        // For binary comparisons on narrow operands, generate PRED constraints.
+        // PRED(operand_bvc, S) where S = {values that make comparison true}
+        // This enables Decide/Restrict to partition the domain by S boundaries.
+        if operands.len() == 2 && result_width == 1 {
+            let aw = self.get(operands[0]).width;
+            let bw = self.get(operands[1]).width;
+
+            // Only generate PREDs for narrow operands (≤8 bits) where we can
+            // compute the value set exactly. For wider operands, theory resolution
+            // handles it via enumeration.
+            if aw <= 8 || bw <= 8 {
+                // Check if either operand is a constant
+                let a_const = self.get_const_value(tt, operands[0]);
+                let b_const = self.get_const_value(tt, operands[1]);
+
+                if let Some(cv) = b_const {
+                    // RHS is constant: PRED on LHS BVC
+                    if aw <= 8 {
+                        let vs = compute_comparison_valueset(op, cv, aw, false);
+                        if !vs.is_full() {
+                            let pred = ct.make_pred(operands[0], vs);
+                            combined_constraint = ct.make_and(combined_constraint, pred);
+                        }
+                    }
+                } else if let Some(cv) = a_const {
+                    // LHS is constant: PRED on RHS BVC
+                    if bw <= 8 {
+                        let vs = compute_comparison_valueset(op, cv, bw, true);
+                        if !vs.is_full() {
+                            let pred = ct.make_pred(operands[1], vs);
+                            combined_constraint = ct.make_and(combined_constraint, pred);
+                        }
+                    }
+                }
+            }
         }
 
         self.alloc(result_width, vec![BvcEntry {
