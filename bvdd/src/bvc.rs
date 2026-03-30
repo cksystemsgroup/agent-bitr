@@ -127,9 +127,10 @@ impl BvcManager {
 
     /// Apply a non-structural operator: keeps the actual operator term.
     ///
-    /// For correctness, we keep the actual computation term so theory
-    /// resolution can evaluate it. Lifting to fresh variables with
-    /// equality constraints is a deferred optimization.
+    /// Currently identical to apply_structural(). Lazy lifting to fresh
+    /// variables requires encoding f == op(args) as a predicate, which
+    /// needs the Decide loop to enumerate f's domain. This is deferred
+    /// until the solver can properly resolve lifted equality predicates.
     pub fn apply_lifted(
         &mut self,
         tt: &mut TermTable,
@@ -138,13 +139,10 @@ impl BvcManager {
         operands: &[BvcId],
         result_width: BvWidth,
     ) -> BvcId {
-        // Same as structural: keep the actual operator term
         self.apply_structural(tt, ct, op, operands, result_width)
     }
 
     /// Apply an operator — keeps the actual operator term for all ops.
-    /// Both structural and non-structural ops produce BVCs with the
-    /// actual computation term. This enables correct theory resolution.
     pub fn apply(
         &mut self,
         tt: &mut TermTable,
