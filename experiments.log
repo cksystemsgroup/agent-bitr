@@ -78,3 +78,13 @@
   - New solves include cal182, stack-p2, pc_sfifo+token_ring combinations
   - Recovered 93.c and analog_estimation_convergence (previously lost to k-ind budget)
   - 35/35 tiny+perf benchmarks correct, 103 tests, 0 clippy warnings
+
+2026-04-03 | COI reduction | cone-of-influence preprocessing | 60/155 BV
+  Changes:
+  - Added cone-of-influence reduction in BTOR2 parser (btor2.rs)
+  - Backward reachability from bad properties and constraints
+  - Removes nodes not affecting any property (e.g., 30% on dspfilters: 6700→4719 nodes)
+  - States outside COI also excluded (dspfilters: 743→522 states)
+  Results:
+  - HWMCC BV: 60/155 (stable)
+  - 35/35 tiny+perf benchmarks correct, 103 tests, 0 clippy warnings

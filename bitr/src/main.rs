@@ -227,7 +227,7 @@ fn solve_btor2(
     max_bound: u32,
     timeout_s: f64,
 ) -> SolveResult {
-    let model = match btor2::parse_btor2(input) {
+    let mut model = match btor2::parse_btor2(input) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("Parse error: {}", e);
@@ -235,9 +235,11 @@ fn solve_btor2(
         }
     };
 
+    // Cone-of-influence reduction: remove nodes not reachable from bad properties
+    let removed = btor2::cone_of_influence(&mut model);
     if verbose {
-        eprintln!("bitr: {} sorts, {} nodes, {} bad properties",
-            model.sorts.len(), model.nodes.len(), model.bad_properties.len());
+        eprintln!("bitr: {} sorts, {} nodes ({} removed by COI), {} bad properties",
+            model.sorts.len(), model.nodes.len(), removed, model.bad_properties.len());
     }
 
     let mut lifted = match lifter::lift_btor2(&model) {
