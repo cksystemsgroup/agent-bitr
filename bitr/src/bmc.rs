@@ -152,7 +152,8 @@ pub fn bmc_check(
 
             let is_ground = bm.is_ground(tt, resolved_bvc);
 
-            // Use BVDD solver for manageable terms, oracle for very large ones
+            // Tiered solving: BVDD (small) → bitblaster (medium) → oracle (large)
+            let width = bm.get(resolved_bvc).width;
             let mut result = if term_size <= 10_000 {
                 let terminal = mgr.make_terminal(resolved_bvc, true, is_ground);
                 let mut ctx = SolverContext::new(tt, ct, bm, &mut mgr);
@@ -172,10 +173,35 @@ pub fn bmc_check(
                 SolveResult::Unknown
             };
 
-            // Only use oracle for very large terms where BVDD is hopeless
+            // Use native CDCL bitblaster for medium terms (10K-200K nodes)
+            if result == SolveResult::Unknown && term_size <= 200_000 {
+                let target = ValueSet::singleton(1);
+                let mut bb = bvdd::bitblast::BitBlaster::new(tt);
+                let (bb_result, bb_witness) = bb.solve(term, width, &target);
+                match bb_result {
+                    SolveResult::Sat => {
+                        // Verify witness
+                        if let Some(val) = tt.eval(term, &bb_witness) {
+                            if target.contains((val & 1) as u8) {
+                                result = SolveResult::Sat;
+                            }
+                        }
+                        if result != SolveResult::Sat {
+                            result = SolveResult::Unknown; // Witness didn't verify
+                        }
+                    }
+                    SolveResult::Unsat => result = SolveResult::Unsat,
+                    SolveResult::Unknown => {} // Budget exceeded, fall through
+                }
+                if config.verbose {
+                    eprintln!("bitr: step {} bad[{}] bitblast={:?} (term_size={}, vars={}, clauses={})",
+                        k, prop_idx, result, term_size, bb.num_vars(), bb.num_clauses());
+                }
+            }
+
+            // External oracle for very large terms
             if result == SolveResult::Unknown && term_size > 50_000 {
                 if let Some(ref mut oracle) = smt_oracle {
-                    let width = bm.get(resolved_bvc).width;
                     result = oracle.check(tt, term, width, ValueSet::singleton(1));
                     if config.verbose {
                         eprintln!("bitr: step {} bad[{}] oracle={:?} (term_size={})",

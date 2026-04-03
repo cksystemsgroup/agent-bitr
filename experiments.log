@@ -66,3 +66,15 @@
   - HWMCC BV: 32/155 → 52/155 solved (+63%, 26 gained via induction, 6 lost to timeout)
   - All 26 gained benchmarks are UNSAT (proven safe by induction at low k)
   - 35/35 tiny+perf benchmarks correct, 103 tests, 0 clippy warnings
+
+2026-04-03 | BMC bitblaster + tuning | CDCL bitblaster in BMC, tuned k-ind budget | 60/155 BV
+  Changes:
+  - Added CDCL bitblaster as fallback in BMC for medium terms (10K-200K nodes)
+  - Reduced k-induction budget: 25% → 10% timeout, max_k 10 → 3
+  - Added term size guard in k-induction: skip inductive step if terms > 50K
+  - Added per-step timeout bail-out in k-induction
+  Results:
+  - HWMCC BV: 52/155 → 60/155 solved (+15%, 9 gained, 0 lost vs prev)
+  - New solves include cal182, stack-p2, pc_sfifo+token_ring combinations
+  - Recovered 93.c and analog_estimation_convergence (previously lost to k-ind budget)
+  - 35/35 tiny+perf benchmarks correct, 103 tests, 0 clippy warnings

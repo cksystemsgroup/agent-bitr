@@ -134,7 +134,12 @@ pub fn kinduction_check(
         }
 
         // === INDUCTIVE STEP: check if P holding for k+1 steps implies P at step k+1 ===
-        if !base_failed && k > 0 {
+        // Skip if base case was unknown, or if term table has grown too large
+        // (indicates term blowup that will make the inductive step infeasible)
+        let term_count = tt.len();
+        let too_large = term_count > 50_000;
+        if !base_failed && k > 0 && !too_large {
+            let step_start = start_time.elapsed().as_secs_f64();
             let inductive_result = check_inductive_step(
                 tt, ct, bm, &mut mgr, &mut smt_oracle,
                 states, bad_properties, constraints, inputs,
@@ -147,6 +152,17 @@ pub fn kinduction_check(
                 }
                 return SolveResult::Unsat; // PROVEN SAFE
             }
+
+            // If inductive step took too long, bail out early
+            let step_elapsed = start_time.elapsed().as_secs_f64() - step_start;
+            if step_elapsed > config.timeout_s * 0.5 {
+                if config.verbose {
+                    eprintln!("bitr: k-induction step took {:.1}s, bailing", step_elapsed);
+                }
+                break;
+            }
+        } else if too_large && config.verbose {
+            eprintln!("bitr: k-induction skipping inductive step (term_count={})", term_count);
         }
 
         // Advance base case to step k+1
