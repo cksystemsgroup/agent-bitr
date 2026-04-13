@@ -65,7 +65,7 @@ struct ComputedEntry {
 }
 
 /// Default computed cache size (power of 2)
-const DEFAULT_CACHE_SIZE: usize = 1 << 16; // 64K entries
+const DEFAULT_CACHE_SIZE: usize = 1 << 20; // 1M entries (~72MB)
 
 impl Default for BvddManager {
     fn default() -> Self { Self::new() }
