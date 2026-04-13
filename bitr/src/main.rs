@@ -282,8 +282,8 @@ fn solve_btor2(
             let mut kind_ct = lifted.ct.clone();
             let mut kind_bm = lifted.bm.clone();
 
-            let kind_timeout = timeout_s * 0.1;
-            let kind_max_k = max_bound.min(3);
+            let kind_timeout = timeout_s * 0.25;
+            let kind_max_k = max_bound.min(10);
             let kind_config = kinduction::KInductionConfig {
                 max_k: kind_max_k,
                 timeout_s: kind_timeout,
@@ -312,7 +312,7 @@ fn solve_btor2(
         }
 
         // Phase 2: Standard BMC on pristine state (remaining time)
-        let bmc_timeout = (timeout_s * 0.9).max(1.0);
+        let bmc_timeout = (timeout_s * 0.75).max(1.0);
         let bmc_config = bmc::BmcConfig {
             max_bound,
             timeout_s: bmc_timeout,

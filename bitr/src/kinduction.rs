@@ -159,11 +159,14 @@ pub fn kinduction_check(
                 return SolveResult::Unsat; // PROVEN SAFE
             }
 
-            // If inductive step took too long, bail out early
+            // If inductive step took too long relative to remaining budget, bail out
             let step_elapsed = start_time.elapsed().as_secs_f64() - step_start;
-            if step_elapsed > config.timeout_s * 0.5 {
+            let remaining = config.timeout_s - start_time.elapsed().as_secs_f64();
+            let remaining_steps = config.max_k.saturating_sub(k);
+            let budget_per_step = if remaining_steps > 0 { remaining / remaining_steps as f64 } else { 0.0 };
+            if step_elapsed > budget_per_step * 2.0 || remaining < 1.0 {
                 if config.verbose {
-                    eprintln!("bitr: k-induction step took {:.1}s, bailing", step_elapsed);
+                    eprintln!("bitr: k-induction step took {:.1}s, remaining={:.1}s, bailing", step_elapsed, remaining);
                 }
                 break;
             }
@@ -342,6 +345,7 @@ fn solve_bvc(
     if result == SolveResult::Unknown && term_size <= 200_000 {
         let target = ValueSet::singleton(1);
         let mut bb = bvdd::bitblast::BitBlaster::new(tt);
+        bb.set_timeout(10.0);
         let (bb_result, bb_witness) = bb.solve(term, width, &target);
         match bb_result {
             SolveResult::Sat => {

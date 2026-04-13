@@ -30,6 +30,10 @@ pub struct BitBlaster<'a> {
     true_lit: i32,
     /// Budget exceeded flag
     exceeded: bool,
+    /// Wall-clock timeout for encoding (seconds, 0 = no timeout)
+    timeout_s: f64,
+    /// Start time for timeout
+    start_time: std::time::Instant,
 }
 
 impl<'a> BitBlaster<'a> {
@@ -42,10 +46,28 @@ impl<'a> BitBlaster<'a> {
             gate_cache: HashMap::new(),
             true_lit: 1,
             exceeded: false,
+            timeout_s: 0.0,
+            start_time: std::time::Instant::now(),
         };
         // Force variable 1 = true
         bb.clauses.push(vec![1]);
         bb
+    }
+
+    /// Set a wall-clock timeout for encoding (seconds)
+    pub fn set_timeout(&mut self, timeout_s: f64) {
+        self.timeout_s = timeout_s;
+        self.start_time = std::time::Instant::now();
+    }
+
+    /// Check if encoding has timed out
+    #[inline]
+    fn check_timeout(&mut self) {
+        if self.timeout_s > 0.0 && self.next_var % 1000 == 0
+            && self.start_time.elapsed().as_secs_f64() > self.timeout_s
+        {
+            self.exceeded = true;
+        }
     }
 
     /// Number of SAT variables allocated so far
@@ -63,6 +85,7 @@ impl<'a> BitBlaster<'a> {
             self.exceeded = true;
             return self.true_lit;
         }
+        self.check_timeout();
         let v = self.next_var;
         self.next_var += 1;
         v

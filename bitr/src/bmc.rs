@@ -181,6 +181,7 @@ pub fn bmc_check(
                 tier_used = "bitblast";
                 let target = ValueSet::singleton(1);
                 let mut bb = bvdd::bitblast::BitBlaster::new(tt);
+                bb.set_timeout(10.0);
                 let (bb_result, bb_witness) = bb.solve(term, width, &target);
                 match bb_result {
                     SolveResult::Sat => {
