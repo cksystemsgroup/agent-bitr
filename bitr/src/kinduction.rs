@@ -152,10 +152,10 @@ pub fn kinduction_check(
         }
 
         // === INDUCTIVE STEP: check if P holding for k+1 steps implies P at step k+1 ===
-        // Skip if base case was unknown. The solver timeouts (5s BVDD, 10s bitblaster)
-        // protect against oversized inductive formulas, so we use a generous term limit.
+        // Skip if base case was unknown, or if term table has grown too large
+        // (indicates term blowup that will make the inductive step infeasible)
         let term_count = tt.len();
-        let too_large = term_count > 300_000;
+        let too_large = term_count > 50_000;
         if !base_failed && k > 0 && !too_large {
             let step_start = start_time.elapsed().as_secs_f64();
             let inductive_result = check_inductive_step(
@@ -344,11 +344,11 @@ fn solve_bvc(
     let term_size = crate::bmc::count_term_nodes(tt, term);
     let is_ground = bm.is_ground(tt, bvc);
 
-    // Tier 1: BVDD solver for small terms (timeout scales with term size)
+    // Tier 1: BVDD solver for small terms (time-bounded to avoid hanging on wide bitvectors)
     let mut result = if term_size <= 10_000 {
         let terminal = mgr.make_terminal(bvc, true, is_ground);
         let mut ctx = SolverContext::new(tt, ct, bm, mgr);
-        ctx.solve_timeout_s = 1.0 + (term_size as f64 / 2500.0);
+        ctx.solve_timeout_s = 5.0;
         if let Some(ref mut oracle) = smt_oracle {
             ctx.set_oracle(|t, term, width, target| {
                 oracle.check(t, term, width, target)
