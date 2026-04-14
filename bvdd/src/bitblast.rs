@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use crate::types::{TermId, OpKind, SolveResult};
 use crate::term::{TermTable, TermKind};
 use crate::valueset::ValueSet;
+use splr::types::Instantiate;
+use splr::solver::SatSolverIF;
 
 /// Maximum SAT variables before bailing out
 const MAX_SAT_VARS: i32 = 1_000_000;
@@ -721,10 +723,35 @@ impl<'a> BitBlaster<'a> {
             })
             .collect();
 
-        // Phase 4: Invoke splr
+        // Phase 4: Invoke splr with timeout
         let clauses = std::mem::take(&mut self.clauses);
+        let num_vars = (self.next_var - 1) as usize;
+        let num_clauses = clauses.len();
 
-        match splr::Certificate::try_from(clauses) {
+        // Configure solver — use generous SAT timeout (process-level timeout handles hangs)
+        let mut config = splr::Config::default();
+        config.c_timeout = 300.0;
+
+        let desc = splr::types::CNFDescription {
+            num_of_variables: num_vars,
+            num_of_clauses: num_clauses,
+            ..Default::default()
+        };
+
+        let mut solver = splr::Solver::instantiate(&config, &desc);
+        let mut conflict = false;
+        for clause in clauses {
+            if conflict { break; }
+            match solver.add_clause(&clause) {
+                Ok(_) => {}
+                Err(_) => { conflict = true; }
+            }
+        }
+        if conflict {
+            return (SolveResult::Unsat, HashMap::new());
+        }
+
+        match splr::solver::SolveIF::solve(&mut solver) {
             Ok(splr::Certificate::SAT(model)) => {
                 let mut witness = HashMap::new();
                 for (var_id, bits) in &var_info {
