@@ -153,7 +153,9 @@ pub fn kinduction_check(
                 prop_bvc = bm.apply(tt, ct, OpKind::And, &[prop_bvc, resolved_c], 1);
             }
             let resolved = crate::bmc::substitute_states(tt, ct, bm, prop_bvc, state_k);
-            let result = solve_bvc(tt, ct, bm, &mut mgr, &mut smt_oracle, resolved);
+            // Base-case solve gets at most the remaining k-induction budget.
+            let base_budget = (config.timeout_s - start_time.elapsed().as_secs_f64()).max(0.5);
+            let result = solve_bvc(tt, ct, bm, &mut mgr, &mut smt_oracle, resolved, base_budget);
 
             if config.verbose {
                 let term = bm.get(resolved).entries[0].term;
@@ -190,10 +192,11 @@ pub fn kinduction_check(
         let too_large = term_count > 50_000;
         if !base_failed && k > 0 && !too_large {
             let step_start = start_time.elapsed().as_secs_f64();
+            let step_budget = (config.timeout_s - step_start).max(0.5);
             let inductive_result = check_inductive_step(
                 tt, ct, bm, &mut mgr, &mut smt_oracle,
                 states, bad_properties, constraints, inputs,
-                &inputs_in_next, k, config.verbose,
+                &inputs_in_next, k, config.verbose, step_budget,
             );
 
             if inductive_result == SolveResult::Unsat {
@@ -277,6 +280,7 @@ fn check_inductive_step(
     inputs_in_next: &std::collections::HashSet<u32>,
     k: u32,
     verbose: bool,
+    budget_s: f64,
 ) -> SolveResult {
     // Create k+1 sets of fresh state variables (unconstrained — no init)
     let mut step_states: Vec<HashMap<u32, BvcId>> = Vec::new();
@@ -352,7 +356,7 @@ fn check_inductive_step(
     }
 
     // Check: is this formula satisfiable?
-    let result = solve_bvc(tt, ct, bm, mgr, smt_oracle, formula);
+    let result = solve_bvc(tt, ct, bm, mgr, smt_oracle, formula, budget_s);
 
     if verbose {
         eprintln!("bitr: inductive step k={}: {:?}", k, result);
@@ -363,6 +367,10 @@ fn check_inductive_step(
 }
 
 /// Solve a BVC using tiered solving: BVDD (small+narrow) → bitblaster (medium) → oracle (large).
+///
+/// `budget_s` is a wall-clock cap for this call spanning all tiers. Internal
+/// tier defaults (5s BVDD, 10s bitblaster, 5s oracle) never exceed it,
+/// preventing a chain of tiers from blowing the outer k-induction budget.
 fn solve_bvc(
     tt: &mut TermTable,
     ct: &mut ConstraintTable,
@@ -370,17 +378,20 @@ fn solve_bvc(
     mgr: &mut BvddManager,
     smt_oracle: &mut Option<oracle::SmtOracle>,
     bvc: BvcId,
+    budget_s: f64,
 ) -> SolveResult {
     let term = bm.get(bvc).entries[0].term;
     let width = bm.get(bvc).width;
     let term_size = crate::bmc::count_term_nodes(tt, term);
     let is_ground = bm.is_ground(tt, bvc);
+    let call_start = std::time::Instant::now();
+    let cap = budget_s.max(0.5);
 
     // Tier 1: BVDD solver for small terms (time-bounded to avoid hanging on wide bitvectors)
     let mut result = if term_size <= 10_000 {
         let terminal = mgr.make_terminal(bvc, true, is_ground);
         let mut ctx = SolverContext::new(tt, ct, bm, mgr);
-        ctx.solve_timeout_s = 5.0;
+        ctx.solve_timeout_s = 5.0_f64.min(cap);
         if let Some(ref mut oracle) = smt_oracle {
             ctx.set_oracle(|t, term, width, target| {
                 oracle.check(t, term, width, target)
@@ -407,7 +418,8 @@ fn solve_bvc(
     if result == SolveResult::Unknown && term_size <= 200_000 {
         let target = ValueSet::singleton(1);
         let mut bb = bvdd::bitblast::BitBlaster::new(tt);
-        bb.set_timeout(10.0);
+        let tier2_remaining = (cap - call_start.elapsed().as_secs_f64()).max(0.5);
+        bb.set_timeout(10.0_f64.min(tier2_remaining));
         let (bb_result, bb_witness) = bb.solve(term, width, &target);
         match bb_result {
             SolveResult::Sat => {

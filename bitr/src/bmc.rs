@@ -141,15 +141,31 @@ pub fn bmc_check(
 
     let mut last_step_time = 0.0f64;
 
+    // Term-table growth bail-out. Once the global term table exceeds this
+    // many nodes, subsequent substitute_states calls become prohibitively
+    // slow (the DAG blows up exponentially with each unroll). Bailing out
+    // returns Unknown rather than hanging — the Phase B incremental BMC
+    // path is what should recover these cases.
+    const TERM_TABLE_BAIL: usize = 500_000;
+
     for k in 0..=config.max_bound {
         let step_start = start_time.elapsed().as_secs_f64();
 
         // Wall-clock timeout — stop exploring deeper, return current result
-        // Also stop if the last step took longer than remaining time budget
+        // Also stop if the last step took longer than remaining time budget.
         let remaining = config.timeout_s - step_start;
         if remaining <= 0.0 || (k > 2 && last_step_time > remaining * 0.8) {
             if config.verbose {
                 eprintln!("bitr: wall-clock timeout at step {}", k);
+            }
+            break;
+        }
+        // Term-table growth bail-out: once we've accumulated too many terms,
+        // substitute_states for the next step will take minutes. Stop cleanly.
+        if tt.len() > TERM_TABLE_BAIL {
+            if config.verbose {
+                eprintln!("bitr: term table grew past {} at step {}, bailing",
+                    TERM_TABLE_BAIL, k);
             }
             break;
         }
@@ -184,12 +200,17 @@ pub fn bmc_check(
             let width = bm.get(resolved_bvc).width;
             let prop_start = Instant::now();
             let mut tier_used = "none";
+            // Remaining wall-clock budget for this property, across all tiers.
+            // Tier-specific defaults (5s BVDD, 10s bitblaster, 5s oracle) must
+            // never exceed this, otherwise per-step solves can silently blow
+            // the outer config.timeout_s by 20s+ per property.
+            let remaining_for_prop = (config.timeout_s - step_start).max(0.5);
             let mut result = if term_size <= 10_000 {
                 tier_used = "bvdd";
                 let terminal = mgr.make_terminal(resolved_bvc, true, is_ground);
                 let mut ctx = SolverContext::new(tt, ct, bm, &mut mgr);
-                // Time-bound the BVDD solver to avoid hanging on wide bitvectors
-                ctx.solve_timeout_s = 5.0;
+                // Cap BVDD tier at min(5s, remaining).
+                ctx.solve_timeout_s = 5.0_f64.min(remaining_for_prop);
                 if let Some(ref mut oracle) = smt_oracle {
                     ctx.set_oracle(|t, term, width, target| {
                         oracle.check(t, term, width, target)
@@ -220,7 +241,9 @@ pub fn bmc_check(
                 tier_used = "bitblast";
                 let target = ValueSet::singleton(1);
                 let mut bb = bvdd::bitblast::BitBlaster::new(tt);
-                bb.set_timeout(10.0);
+                // Cap at min(10s, remaining for property).
+                let bb_remaining = (config.timeout_s - start_time.elapsed().as_secs_f64()).max(0.5);
+                bb.set_timeout(10.0_f64.min(bb_remaining));
                 let (bb_result, bb_witness) = bb.solve(term, width, &target);
                 match bb_result {
                     SolveResult::Sat => {
