@@ -1,8 +1,8 @@
-# agent-bitr
+# bitr
 
 **Hypothesis**: Do Bitvector Decision Diagrams (BVDDs) represent reasoning state efficiently and effectively enough to outperform the state of the art in SMT solving and bounded model checking on hardware and software verification benchmarks?
 
-Agent-bitr is inspired by [agent-sat](https://github.com/iliazintchenko/agent-sat). However, unlike agent-sat, which aims at demonstrating that AI agents may autonomously discover competitive solving techniques for a well-understood problem (SAT), agent-bitr tests whether agents can build a competitive solver around a **novel, unproven data structure** encoded as agent skill. The question is not just "can agents build a solver?" but "do BVDDs — where the decision diagram IS the complete solver state — provide a unified representation of the usually separate clause databases and assignment trails of conventional CDCL(T) and DPLL(T) solvers and bounded model checkers?". Similar to agent-sat, success is determined through benchmarking against existing state-of-the-art tools.
+bitr is inspired by [agent-sat](https://github.com/iliazintchenko/agent-sat). However, unlike agent-sat, which aims at demonstrating that AI agents may autonomously discover competitive solving techniques for a well-understood problem (SAT), bitr tests whether agents can build a competitive solver around a **novel, unproven data structure** encoded as agent skill. The question is not just "can agents build a solver?" but "do BVDDs — where the decision diagram IS the complete solver state — provide a unified representation of the usually separate clause databases and assignment trails of conventional CDCL(T) and DPLL(T) solvers and bounded model checkers?". Similar to agent-sat, success is determined through benchmarking against existing state-of-the-art tools.
 
 ## What are BVDDs?
 
