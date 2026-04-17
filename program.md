@@ -12,8 +12,31 @@ Build a competitive BTOR2 model checker based on Bitvector Decision Diagrams (BV
 
 ## Current Status
 
-**Phase**: 10 — Optimization in progress
-**Last updated**: 2026-04-02
+**Phase**: 10+ — Correctness foundation landed; competitiveness push in flight
+**Last updated**: 2026-04-17
+
+### 2026-04-17 — Correctness + Incremental BMC landed (commits 72d7d1a, 5c88523, d98856b)
+See the plan at `/Users/ck/.claude/plans/make-a-plan-on-melodic-dolphin.md` and the
+detailed log entries in `experiments.log`.
+
+- [x] **A1** BMC bound-exhausted → Unknown (was Unsat) — eliminates wrong-UNSAT
+- [x] **A2** SAT witness verification (extract_witness_verified + BMC/kind downgrade)
+- [x] **A3** `--verify` flag: oracle cross-check with panic-on-mismatch
+- [x] **A4** Golden tests lock in 16 tiny benchmarks
+- [x] **A5** Reset-signal soundness fence (collect_non_reset_uses)
+- [x] **B** Incremental SAT BMC module + BitBlaster snapshot API
+- [x] **C2** Bitblaster ITE memoization + 11 peepholes
+- [x] Internal tier timeouts now capped by outer budget; Python sweep runner
+      (`scripts/run_sweep.py`) enforces wall-clock via SIGKILL on timeout+5s
+- [x] 120/120 tests passing, 0 clippy warnings
+- [ ] HWMCC BV 155-benchmark sweep measurement (in progress)
+
+### Open (post-sweep direction)
+- [ ] Default-on `--incremental-bmc` if sweep shows net gain
+- [ ] Phase D: inductive generalization for `kind_only` timeouts
+- [ ] AIG structural rewriting in bitblaster (larger than just ITE)
+- [ ] Cooperative timeout cancellation inside substitute_states (term DAG walk
+      can blow budget; Python wrapper masks this today)
 
 ### Phase 0 (complete)
 - [x] Repository structure created
