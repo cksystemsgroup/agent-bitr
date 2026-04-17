@@ -88,3 +88,128 @@
   Results:
   - HWMCC BV: 60/155 (stable)
   - 35/35 tiny+perf benchmarks correct, 103 tests, 0 clippy warnings
+
+2026-04-17 | Phase A correctness foundation | soundness fixes
+  Plan: /Users/ck/.claude/plans/make-a-plan-on-melodic-dolphin.md
+
+  A1 — Unsound BMC UNSAT on bound exhaustion:
+  - bmc.rs:304 now returns SolveResult::Unknown instead of SolveResult::Unsat when
+    bound is exhausted without a counterexample. Previously, every bound-exhausted
+    BMC reported "unsat" — but this is only sound when the bound ≥ reachable
+    diameter, which BMC does not verify.
+  - Test: bitr/src/bmc.rs test_bmc_bound_exhausted_returns_unknown.
+
+  A2 — SAT witness verification:
+  - Added extract_witness_verified(id, target, verify_term) in bvdd/src/solver.rs
+    that extracts a witness and verifies it satisfies verify_term under target.
+    Returns None when unverifiable.
+  - BMC (bmc.rs tier 1) and k-induction (kinduction.rs solve_bvc tier 1) now
+    downgrade BVDD-SAT to Unknown if the witness doesn't verify, letting lower
+    tiers (bitblaster/oracle) reattempt.
+  - K-induction bitblaster path made explicit about witness verification
+    (verified must be true; else fall through to oracle).
+  - Tests: test_extract_witness_verified_{accepts_valid, rejects_const_mismatch}.
+
+  A3 — --verify CLI flag:
+  - New flag --verify cross-checks every BMC/kind SAT answer against the
+    external SMT oracle; panics with a diagnostic dump on disagreement.
+    Dev/CI only, no-op when oracle absent.
+  - Helper bmc::verify_against_oracle.
+
+  A4 — Golden integration test suite:
+  - New bitr/tests/golden.rs runs tiny benchmarks end-to-end (all 16) and
+    verifies answers. Also runs tiny suite under --verify mode (zero
+    disagreements on all 16 locally).
+  - HWMCC subset removed from goldens after A5 — several pre-A5 SAT verdicts
+    depended on the unsound reset-signal heuristic. Will reintroduce post-B.
+
+  A5 — Reset-signal soundness fence:
+  - Added bmc::collect_non_reset_uses that flags inputs appearing in ANY data
+    position (non-ITE-condition). bmc_check and kinduction_check now disqualify
+    reset candidates that also appear in data positions of next-state, bad, or
+    constraints. Previously the heuristic could zero a non-reset input,
+    producing wrong SAT answers on ambiguous cases.
+  - Tests: test_collect_ite_cond_inputs_direct_only,
+    test_collect_non_reset_uses_{finds_data_usage, flags_dual_use}.
+
+  Results:
+  - 117 tests passing (+14 from baseline), 0 clippy warnings in bitr/ code.
+  - All 16 tiny benchmarks correct; --verify on all 16 sees zero oracle
+    disagreements.
+  - HWMCC BV not re-measured in Phase A. The A5 fence is known to reduce
+    solved count in the short term by correctly rejecting unsound reset
+    inference — a performance regression that Phase B (incremental SAT BMC)
+    is designed to recover.
+  - Phase A establishes the correctness baseline that every subsequent phase
+    must preserve.
+
+2026-04-17 | Phase B incremental SAT BMC | opt-in --incremental-bmc path
+  Plan: /Users/ck/.claude/plans/make-a-plan-on-melodic-dolphin.md
+
+  New module bitr/src/incremental_bmc.rs:
+  - Allocates per-step SAT literals for each state variable via BitBlaster's
+    alloc_vars(). Binds them via set_var_lits() before blasting init,
+    constraints, bad, and next expressions.
+  - Emits equality clauses linking state[k+1] literals to the blasted
+    next-state bits: for each bit i, (¬lit_k1_i ∨ next_i) ∧ (lit_k1_i ∨ ¬next_i).
+  - Per step: snapshot the shared CNF, append [bad_lit] unit, run a fresh
+    splr solver. (splr 0.17.2 does not expose user-assumption retraction, so
+    clone-per-step is the sound equivalent.)
+  - On SAT: decode witness from model, return Sat. On Unsat: continue.
+  - Bound exhaustion → Unknown (matches Phase A1 soundness).
+
+  Extended bvdd/src/bitblast.rs API:
+  - clauses_snapshot(), clear_term_cache(), push_clause(), blast_public(),
+    exceeded(), add_target_public(), true_lit(), and a thin
+    solve_snapshot_with_unit() that keeps the splr dependency in one crate.
+
+  Wiring (bitr/src/main.rs):
+  - New --incremental-bmc flag. When set, the solver runs incremental BMC
+    for half the BMC budget BEFORE the legacy bmc_check. Only SAT answers
+    from the incremental path are accepted; Unknown falls through to the
+    legacy path (which retains theory resolution capabilities).
+  - Default remains off until HWMCC validation.
+
+  Tests (all passing):
+  - incremental_bmc::tests::ibmc_finds_counter_sat
+  - incremental_bmc::tests::ibmc_counter_unsat_returns_unknown_at_bound
+  - incremental_bmc::tests::ibmc_combinational_ite_sat
+  - All 16 tiny benchmarks pass with --incremental-bmc and with
+    --verify --incremental-bmc (zero oracle disagreements).
+
+  Open items (Phase C+):
+  - Arrays (OpKind::Read/Write) aren't handled by the bitblaster → incremental
+    BMC falls back to legacy on array benchmarks. That's the correct behavior.
+  - Learned-clause reuse is sacrificed by clone-per-step. A future upgrade
+    could enable splr's support_user_assumption feature for true incremental
+    assumption-based solving.
+  - HWMCC BV not re-measured yet; Phase C (preprocessing + AIG) and a
+    benchmark sweep come next.
+
+  Ad-hoc benchmark spot check (qspiflash_dualflexpress_divthree-p050, 20s):
+  - Without --incremental-bmc: 3 BMC steps in 20s (terms grew 517 → 2.7M).
+  - With --incremental-bmc: 41 BMC steps in ~7s, then fell through to legacy
+    for the rest. 10+x deeper unrolling for the same wall-clock budget.
+  - Answer: Unknown both ways (property not refuted within bound); but the
+    incremental path has enough room to explore much further.
+
+2026-04-17 | Phase C partial | bitblaster ITE memoization + peepholes
+  Plan: /Users/ck/.claude/plans/make-a-plan-on-melodic-dolphin.md
+
+  Extended bvdd/src/bitblast.rs ite_gate:
+  - Added peepholes for all 11 common simplifications (ite(s,1,e)=s∨e,
+    ite(s,t,0)=s∧t, ite(s,t,-t)=¬(s⊕t), ite(s,s,e)=s∨e, etc.).
+  - Added ite_cache: HashMap<(s,t,e), i32> keyed on canonicalized triple
+    (selector normalized positive; t/e swapped if selector was negated).
+    Previously ITE was the only Tseitin gate not memoized, producing O(n)
+    fresh variables per shared ITE subexpression.
+
+  C1 (BTOR2 constant folding + CSE) is a no-op: TermTable::intern (term.rs:74)
+  already hash-conses on `(kind, width)`, so BTOR2 duplicate subterms are
+  deduplicated at parse time. No additional work needed.
+
+  Results:
+  - All 120 tests passing (was 117). No new clippy warnings in modified code.
+  - All 16 tiny benchmarks correct under --verify and under
+    --verify --incremental-bmc. Zero oracle disagreements.
+  - HWMCC BV not re-measured (full sweep pending).

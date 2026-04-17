@@ -28,6 +28,11 @@ pub struct BitBlaster<'a> {
     /// Gate memoization: (min_lit, max_lit, op_tag) -> output literal
     /// op_tag: 0=AND, 1=OR, 2=XOR
     gate_cache: HashMap<(i32, i32, u8), i32>,
+    /// ITE gate memoization: (selector, then_lit, else_lit) with positive
+    /// selector (else-branch and then-branch swapped when selector was negative).
+    /// Separate from gate_cache because the full 3-tuple key doesn't fit in
+    /// the 2-lit layout.
+    ite_cache: HashMap<(i32, i32, i32), i32>,
     /// Constant-true literal (variable 1, forced true)
     true_lit: i32,
     /// Budget exceeded flag
@@ -48,6 +53,7 @@ impl<'a> BitBlaster<'a> {
             clauses: Vec::with_capacity(4096),
             term_bits: HashMap::new(),
             gate_cache: HashMap::new(),
+            ite_cache: HashMap::new(),
             true_lit: 1,
             exceeded: false,
             timeout_s: 0.0,
@@ -78,6 +84,104 @@ impl<'a> BitBlaster<'a> {
     /// Take the accumulated clauses (moves them out)
     pub fn take_clauses(&mut self) -> Vec<Vec<i32>> {
         std::mem::take(&mut self.clauses)
+    }
+
+    /// Snapshot (clone) the current accumulated clauses without consuming them.
+    /// Use this in incremental BMC: the accumulated clauses encode shared
+    /// init/transition logic, and per step we want to run SAT with snapshot +
+    /// a per-step "bad" unit clause without losing the shared CNF buffer.
+    pub fn clauses_snapshot(&self) -> Vec<Vec<i32>> {
+        self.clauses.clone()
+    }
+
+    /// Clear the term-output memoization cache. The gate cache and the global
+    /// clause buffer are preserved.
+    ///
+    /// Required between incremental BMC steps: when state-variable literals
+    /// are rebound via [`set_var_lits`] for step k+1, the cached per-TermId
+    /// bit vectors from step k would otherwise be reused, producing an
+    /// encoding that references the wrong step's literals.
+    pub fn clear_term_cache(&mut self) {
+        self.term_bits.clear();
+    }
+
+    /// Append a clause directly to the accumulated CNF. Used by incremental
+    /// BMC to add equality links between step[k]'s computed next-state bits
+    /// and step[k+1]'s state-variable literals.
+    pub fn push_clause(&mut self, clause: Vec<i32>) {
+        self.add_clause(clause);
+    }
+
+    /// Blast a term and return its output bit literals. Exposed for
+    /// incremental BMC; regular solve paths should continue to use [`solve`].
+    pub fn blast_public(&mut self, term: TermId) -> Option<Vec<i32>> {
+        self.blast_term(term)
+    }
+
+    /// Are we over budget? Callers should abort and fall back on `true`.
+    pub fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+
+    /// Emit CNF for the target-value constraint on `result_bits`. Callers that
+    /// want to drive solving themselves (incremental BMC) use this to assert
+    /// "the result must lie in `target`" without invoking the built-in solve.
+    pub fn add_target_public(&mut self, result_bits: &[i32], width: u16, target: &ValueSet) {
+        self.add_target_constraint(result_bits, width, target);
+    }
+
+    /// The always-true literal (SAT var 1). Callers use this to construct
+    /// unit clauses (e.g., `[bad_lit]`) and to reference constants.
+    pub fn true_lit(&self) -> i32 {
+        self.true_lit
+    }
+
+    /// Run splr over a snapshot of the current CNF plus an extra unit clause
+    /// `[extra_lit]`. Returns `(SolveResult, model)` where model is the
+    /// DIMACS-style assignment vector (positive = var is true, negative = false).
+    ///
+    /// This is the core SAT-call used by incremental BMC: the shared CNF
+    /// accumulates across unrolling steps, and per step we append a "bad is
+    /// true" unit and run a fresh solver (splr doesn't expose incremental
+    /// assumption retraction in this crate version).
+    ///
+    /// `timeout_s` bounds the splr wall-clock. 0 means use a generous default.
+    pub fn solve_snapshot_with_unit(
+        &self,
+        extra_lit: i32,
+        timeout_s: f64,
+    ) -> (SolveResult, Vec<i32>) {
+        let clauses = self.clauses_snapshot();
+        let num_vars = (self.next_var - 1) as usize;
+        let num_clauses = clauses.len() + 1;
+
+        let config = splr::Config {
+            c_timeout: if timeout_s > 0.0 { timeout_s } else { 30.0 },
+            ..Default::default()
+        };
+        let desc = splr::types::CNFDescription {
+            num_of_variables: num_vars,
+            num_of_clauses: num_clauses,
+            ..Default::default()
+        };
+        let mut solver = splr::Solver::instantiate(&config, &desc);
+
+        for c in &clauses {
+            match solver.add_clause(c) {
+                Ok(_) => {}
+                Err(_) => return (SolveResult::Unsat, Vec::new()),
+            }
+        }
+        match solver.add_clause([extra_lit]) {
+            Ok(_) => {}
+            Err(_) => return (SolveResult::Unsat, Vec::new()),
+        }
+
+        match splr::solver::SolveIF::solve(&mut solver) {
+            Ok(splr::Certificate::SAT(model)) => (SolveResult::Sat, model),
+            Ok(splr::Certificate::UNSAT) => (SolveResult::Unsat, Vec::new()),
+            Err(_) => (SolveResult::Unknown, Vec::new()),
+        }
     }
 
     /// Set a wall-clock timeout for encoding (seconds)
@@ -192,16 +296,49 @@ impl<'a> BitBlaster<'a> {
     }
 
     /// c <-> ITE(s, t, e)
+    ///
+    /// Peepholes for common patterns, then memoized by a canonical key with
+    /// positive selector. Without memoization, a common subexpression like
+    /// `ite(cond, same_true, same_false)` generated from repeated READ/WRITE
+    /// expansion would produce O(n) fresh variables instead of one.
     fn ite_gate(&mut self, s: i32, t: i32, e: i32) -> i32 {
+        // Selector is a constant.
         if s == self.true_lit { return t; }
         if s == -self.true_lit { return e; }
+        // Branches equal.
         if t == e { return t; }
+        // ite(s, true, e) = s OR e; ite(s, false, e) = (¬s) AND e.
+        if t == self.true_lit { return self.or_gate(s, e); }
+        if t == -self.true_lit { return self.and_gate(-s, e); }
+        // ite(s, t, false) = s AND t; ite(s, t, true) = (¬s) OR t.
+        if e == -self.true_lit { return self.and_gate(s, t); }
+        if e == self.true_lit { return self.or_gate(-s, t); }
+        // ite(s, t, -t) = s XNOR t, i.e., ¬XOR(s, t).
+        if e == -t { let x = self.xor_gate(s, t); return -x; }
+        // ite(s, s, e) = s OR e (if s=1 → pick s=1; if s=0 → pick e).
+        if t == s { return self.or_gate(s, e); }
+        // ite(s, -s, e) = (¬s) AND e (if s=1 → pick -s=0; if s=0 → pick e).
+        if t == -s { return self.and_gate(-s, e); }
+        // ite(s, t, s) = s AND t (if s=1 → t; if s=0 → s=0).
+        if e == s { return self.and_gate(s, t); }
+        // ite(s, t, -s) = (¬s) OR t (if s=1 → t; if s=0 → -s=1).
+        if e == -s { return self.or_gate(-s, t); }
+
+        // Canonicalize: normalize to positive selector by flipping s and
+        // swapping t, e. This ensures ite(s,t,e) and ite(-s,e,t) share a
+        // cache entry.
+        let (s_can, t_can, e_can) = if s < 0 { (-s, e, t) } else { (s, t, e) };
+        let triple_key = (s_can, t_can, e_can);
+        if let Some(&c) = self.ite_cache.get(&triple_key) {
+            return c;
+        }
 
         let c = self.fresh_var();
         self.add_clause(vec![-s, -t, c]);
         self.add_clause(vec![-s, t, -c]);
         self.add_clause(vec![s, -e, c]);
         self.add_clause(vec![s, e, -c]);
+        self.ite_cache.insert(triple_key, c);
         c
     }
 

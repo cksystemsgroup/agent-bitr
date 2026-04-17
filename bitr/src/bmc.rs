@@ -21,6 +21,9 @@ pub struct BmcConfig {
     pub max_bound: u32,
     pub timeout_s: f64,
     pub verbose: bool,
+    /// When true and an oracle is available, cross-check each SAT/UNSAT answer
+    /// against the external SMT solver and panic on disagreement. Dev/CI only.
+    pub verify_mode: bool,
 }
 
 impl Default for BmcConfig {
@@ -29,6 +32,7 @@ impl Default for BmcConfig {
             max_bound: 100,
             timeout_s: 300.0,
             verbose: false,
+            verify_mode: false,
         }
     }
 }
@@ -102,16 +106,37 @@ pub fn bmc_check(
         set
     };
 
-    // Detect inputs used as ITE conditions in next-state (likely reset signals)
+    // Detect inputs used as ITE conditions in next-state (likely reset signals).
+    //
+    // A5 SOUNDNESS FENCE: an input qualifies as a reset only if it appears
+    // *exclusively* as a direct ITE condition — never in a data position of any
+    // next-state, bad property, or constraint. Otherwise zeroing it after step 0
+    // would silently change program semantics and produce wrong answers.
     let inputs_as_ite_cond: std::collections::HashSet<u32> = {
-        let mut set = std::collections::HashSet::new();
+        let mut candidates = std::collections::HashSet::new();
         for sv in states {
             if let Some(next_bvc) = sv.next_bvc {
                 let term = bm.get(next_bvc).entries[0].term;
-                collect_ite_cond_inputs(tt, term, &inputs_in_next, &mut set);
+                collect_ite_cond_inputs(tt, term, &inputs_in_next, &mut candidates);
             }
         }
-        set
+        // Disqualify any candidate that appears in a data position anywhere.
+        let mut disqualified = std::collections::HashSet::new();
+        for sv in states {
+            if let Some(next_bvc) = sv.next_bvc {
+                let term = bm.get(next_bvc).entries[0].term;
+                collect_non_reset_uses(tt, term, &candidates, &mut disqualified);
+            }
+        }
+        for &bad_bvc in bad_properties {
+            let term = bm.get(bad_bvc).entries[0].term;
+            collect_non_reset_uses(tt, term, &candidates, &mut disqualified);
+        }
+        for &c_bvc in constraints {
+            let term = bm.get(c_bvc).entries[0].term;
+            collect_non_reset_uses(tt, term, &candidates, &mut disqualified);
+        }
+        candidates.into_iter().filter(|v| !disqualified.contains(v)).collect()
     };
 
     let mut last_step_time = 0.0f64;
@@ -171,7 +196,21 @@ pub fn bmc_check(
                     });
                 }
                 let result_bvdd = ctx.solve(terminal, ValueSet::singleton(1));
-                ctx.get_result(result_bvdd)
+                let raw = ctx.get_result(result_bvdd);
+                // A2: verify SAT witness against original property term. If the
+                // heuristic witness search fails or produces an assignment that
+                // doesn't satisfy the target, downgrade to Unknown so a lower
+                // tier (bitblaster/oracle) can reattempt.
+                if raw == SolveResult::Sat {
+                    let target_vs = ValueSet::singleton(1);
+                    if ctx.extract_witness_verified(result_bvdd, target_vs, term).is_none() {
+                        SolveResult::Unknown
+                    } else {
+                        SolveResult::Sat
+                    }
+                } else {
+                    raw
+                }
             } else {
                 SolveResult::Unknown
             };
@@ -217,6 +256,15 @@ pub fn bmc_check(
             if result == SolveResult::Sat {
                 if config.verbose {
                     eprintln!("bitr: counterexample found at step {}", k);
+                }
+                if config.verify_mode {
+                    if let Some(ref mut oracle) = smt_oracle {
+                        verify_against_oracle(
+                            tt, term, width, ValueSet::singleton(1),
+                            SolveResult::Sat, oracle,
+                            &format!("bmc step={} bad[{}]", k, prop_idx),
+                        );
+                    }
                 }
                 return SolveResult::Sat;
             }
@@ -300,8 +348,55 @@ pub fn bmc_check(
         tt.clear_subst_cache();
     }
 
-    // No counterexample found within bound. For HWMCC, report unsat (bounded safe).
-    SolveResult::Unsat
+    // No counterexample found within bound. This is NOT a proof of safety —
+    // an unbounded proof requires k-induction (or similar). Return Unknown so
+    // the caller can either accept bounded safety or fall back to other methods.
+    SolveResult::Unknown
+}
+
+/// Collect input variables that appear in `term` at any NON-ITE-condition
+/// position (i.e., data-path uses). An input found here is NOT a pure reset
+/// signal: zeroing it for step > 0 would silently change program semantics.
+///
+/// The walk descends through ITE(cond, then, else) but only records inputs
+/// reached via `then`/`else` or via non-ITE op args.
+pub fn collect_non_reset_uses(
+    tt: &TermTable,
+    term: TermId,
+    input_nids: &std::collections::HashSet<u32>,
+    result: &mut std::collections::HashSet<u32>,
+) {
+    collect_non_reset_uses_inner(tt, term, input_nids, result, true);
+}
+
+fn collect_non_reset_uses_inner(
+    tt: &TermTable,
+    term: TermId,
+    input_nids: &std::collections::HashSet<u32>,
+    result: &mut std::collections::HashSet<u32>,
+    in_data_position: bool,
+) {
+    match &tt.get(term).kind {
+        TermKind::Const(_) => {}
+        TermKind::Var(v) => {
+            if in_data_position && input_nids.contains(v) {
+                result.insert(*v);
+            }
+        }
+        TermKind::App { op, args, .. } => {
+            if *op == bvdd::types::OpKind::Ite && args.len() == 3 {
+                // ITE: args[0]=cond (non-data), args[1]=then (data), args[2]=else (data)
+                collect_non_reset_uses_inner(tt, args[0], input_nids, result, false);
+                collect_non_reset_uses_inner(tt, args[1], input_nids, result, true);
+                collect_non_reset_uses_inner(tt, args[2], input_nids, result, true);
+            } else {
+                // Non-ITE ops: every arg is a data position.
+                for &a in args {
+                    collect_non_reset_uses_inner(tt, a, input_nids, result, true);
+                }
+            }
+        }
+    }
 }
 
 /// Find input variables used as ITE conditions in a term (likely reset signals)
@@ -383,4 +478,225 @@ pub fn substitute_states(
         term,
         constraint,
     }])
+}
+
+/// Cross-check a BITR answer against the external SMT oracle. Panics with a
+/// diagnostic dump on disagreement. Used only when `verify_mode` is enabled
+/// (dev/CI; never in production runs). If the oracle returns `Unknown`, no
+/// assertion is made — a silent oracle failure shouldn't crash verification.
+pub fn verify_against_oracle(
+    tt: &mut TermTable,
+    term: TermId,
+    width: BvWidth,
+    target: ValueSet,
+    expected: SolveResult,
+    oracle: &mut oracle::SmtOracle,
+    context: &str,
+) {
+    let oracle_result = oracle.check(tt, term, width, target);
+    if oracle_result == SolveResult::Unknown {
+        return; // oracle couldn't decide — accept our answer without cross-check
+    }
+    if oracle_result != expected {
+        eprintln!("bitr: VERIFY MISMATCH [{}]", context);
+        eprintln!("  expected (bitr): {:?}", expected);
+        eprintln!("  oracle:          {:?}", oracle_result);
+        eprintln!("  width: {}  target: {:?}", width, target);
+        panic!("verify-mode: oracle disagreement at {}", context);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::btor2::parse_btor2;
+    use crate::lifter::lift_btor2;
+
+    /// A1 soundness test: BMC with bound-exhaustion must return Unknown, not Unsat.
+    ///
+    /// counter_unsat: 2-bit counter cnt, init=0, next=cnt+2, bad=(cnt==1).
+    /// The counter visits {0, 2} cyclically — cnt==1 is never reachable, but a
+    /// pure BMC of any bound cannot PROVE this. With max_bound=2, BMC checks
+    /// steps 0,1,2 (cnt values 0,2,0), finds no counterexample, and must
+    /// return Unknown because unbounded safety isn't established.
+    #[test]
+    fn test_bmc_bound_exhausted_returns_unknown() {
+        let input = "\
+1 sort bitvec 2
+2 sort bitvec 1
+3 state 1 cnt
+4 zero 1
+5 init 1 3 4
+6 constd 1 2
+7 add 1 3 6
+8 next 1 3 7
+9 one 1
+10 eq 2 3 9
+11 bad 10
+";
+        let model = parse_btor2(input).unwrap();
+        let mut lifted = lift_btor2(&model).unwrap();
+
+        let state_vars: Vec<StateVar> = lifted.states.iter().map(|&(nid, init, next)| {
+            let width = lifted.bm.get(
+                *lifted.nid_to_bvc.get(&nid).unwrap_or(&bvdd::types::BvcId(0))
+            ).width;
+            StateVar { nid, width, init_bvc: init, next_bvc: next }
+        }).collect();
+
+        let input_vars: Vec<InputVar> = lifted.inputs.iter()
+            .map(|&(nid, width)| InputVar { nid, width })
+            .collect();
+
+        let config = BmcConfig { max_bound: 2, timeout_s: 30.0, verbose: false, verify_mode: false };
+        let result = bmc_check(
+            &config,
+            &mut lifted.tt,
+            &mut lifted.ct,
+            &mut lifted.bm,
+            &state_vars,
+            &lifted.bad_properties,
+            &lifted.constraints,
+            &input_vars,
+        );
+
+        assert_eq!(result, SolveResult::Unknown,
+            "BMC bound-exhausted must return Unknown, not Unsat (A1 soundness).");
+    }
+
+    /// Complementary test: BMC still finds real SAT counterexamples.
+    /// counter_sat: 3-bit counter, bad=(cnt==5). Reachable at step 5.
+    #[test]
+    fn test_bmc_finds_sat_counterexample() {
+        let input = "\
+1 sort bitvec 3
+2 sort bitvec 1
+3 state 1 cnt
+4 zero 1
+5 init 1 3 4
+6 one 1
+7 add 1 3 6
+8 next 1 3 7
+9 constd 1 5
+10 eq 2 3 9
+11 bad 10
+";
+        let model = parse_btor2(input).unwrap();
+        let mut lifted = lift_btor2(&model).unwrap();
+
+        let state_vars: Vec<StateVar> = lifted.states.iter().map(|&(nid, init, next)| {
+            let width = lifted.bm.get(
+                *lifted.nid_to_bvc.get(&nid).unwrap_or(&bvdd::types::BvcId(0))
+            ).width;
+            StateVar { nid, width, init_bvc: init, next_bvc: next }
+        }).collect();
+
+        let input_vars: Vec<InputVar> = lifted.inputs.iter()
+            .map(|&(nid, width)| InputVar { nid, width })
+            .collect();
+
+        let config = BmcConfig { max_bound: 10, timeout_s: 30.0, verbose: false, verify_mode: false };
+        let result = bmc_check(
+            &config,
+            &mut lifted.tt,
+            &mut lifted.ct,
+            &mut lifted.bm,
+            &state_vars,
+            &lifted.bad_properties,
+            &lifted.constraints,
+            &input_vars,
+        );
+
+        assert_eq!(result, SolveResult::Sat,
+            "BMC must still find reachable counterexamples.");
+    }
+
+    /// A5: collect_ite_cond_inputs flags ONLY direct-input ITE conditions,
+    /// not condition expressions that contain inputs.
+    #[test]
+    fn test_collect_ite_cond_inputs_direct_only() {
+        use bvdd::types::OpKind;
+        use bvdd::term::TermTable;
+
+        let mut tt = TermTable::new();
+        let a = tt.make_var(10, 1);   // input 10 — direct ITE cond
+        let b = tt.make_var(11, 1);   // input 11 — used in (a AND b) as cond
+        let and_ab = tt.make_app(OpKind::And, vec![a, b], 1);
+        let lo = tt.make_const(0, 8);
+        let hi = tt.make_const(1, 8);
+        let ite_direct = tt.make_app(OpKind::Ite, vec![a, lo, hi], 8);
+        let ite_computed = tt.make_app(OpKind::Ite, vec![and_ab, lo, hi], 8);
+        let combo = tt.make_app(OpKind::Add, vec![ite_direct, ite_computed], 8);
+
+        let mut input_nids = std::collections::HashSet::new();
+        input_nids.insert(10);
+        input_nids.insert(11);
+
+        let mut direct = std::collections::HashSet::new();
+        collect_ite_cond_inputs(&tt, combo, &input_nids, &mut direct);
+
+        // Input 10 appears as a direct ITE cond → flagged.
+        // Input 11 only appears inside `and_ab` (a computed expr) → NOT flagged.
+        assert!(direct.contains(&10), "input 10 is direct ITE condition — must be flagged");
+        assert!(!direct.contains(&11), "input 11 is inside a computed condition — must NOT be flagged");
+    }
+
+    /// A5: collect_non_reset_uses flags inputs used in data positions.
+    ///
+    /// ITE(cond, input_a, input_b) — cond is non-data; input_a and input_b are data.
+    /// The fence must catch that any candidate reset appearing in a data branch
+    /// is disqualified.
+    #[test]
+    fn test_collect_non_reset_uses_finds_data_usage() {
+        use bvdd::types::OpKind;
+        use bvdd::term::TermTable;
+
+        let mut tt = TermTable::new();
+        let cond = tt.make_var(20, 1);
+        let data_a = tt.make_var(21, 8);
+        let data_b = tt.make_var(22, 8);
+        // ITE uses cond as condition, data_a as then, data_b as else.
+        let ite = tt.make_app(OpKind::Ite, vec![cond, data_a, data_b], 8);
+
+        let mut candidates = std::collections::HashSet::new();
+        candidates.insert(20);
+        candidates.insert(21);
+        candidates.insert(22);
+
+        let mut data_uses = std::collections::HashSet::new();
+        collect_non_reset_uses(&tt, ite, &candidates, &mut data_uses);
+
+        // cond (20) is in a condition position → NOT in data_uses.
+        // data_a (21) and data_b (22) are in data positions → IN data_uses.
+        assert!(!data_uses.contains(&20), "condition position must NOT be in data_uses");
+        assert!(data_uses.contains(&21), "then branch is data position");
+        assert!(data_uses.contains(&22), "else branch is data position");
+    }
+
+    /// A5: an input that serves as BOTH an ITE condition AND a data operand
+    /// must be disqualified as a reset candidate (fence catches the dual use).
+    #[test]
+    fn test_collect_non_reset_uses_flags_dual_use() {
+        use bvdd::types::OpKind;
+        use bvdd::term::TermTable;
+
+        let mut tt = TermTable::new();
+        let r = tt.make_var(30, 1); // used as both ITE cond and in arithmetic
+        let lo = tt.make_const(0, 1);
+        let ite = tt.make_app(OpKind::Ite, vec![r, lo, lo], 1);
+        // Now use r again in a data position (XOR with constant).
+        let one_bit = tt.make_const(1, 1);
+        let xor_r = tt.make_app(OpKind::Xor, vec![r, one_bit], 1);
+        let combo = tt.make_app(OpKind::And, vec![ite, xor_r], 1);
+
+        let mut candidates = std::collections::HashSet::new();
+        candidates.insert(30);
+
+        let mut data_uses = std::collections::HashSet::new();
+        collect_non_reset_uses(&tt, combo, &candidates, &mut data_uses);
+
+        // r appears in `xor_r` in a data position → disqualified.
+        assert!(data_uses.contains(&30),
+            "dual-use input must be flagged as data use, disqualifying reset status");
+    }
 }

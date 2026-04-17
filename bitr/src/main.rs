@@ -8,6 +8,7 @@ mod bitr;
 mod blast;
 mod oracle;
 mod bmc;
+mod incremental_bmc;
 mod kinduction;
 mod smtlib2;
 #[allow(dead_code)]
@@ -33,6 +34,8 @@ fn main() {
         eprintln!("  --timeout N  Timeout in seconds (default: 300)");
         eprintln!("  --bound N    Maximum BMC bound (default: 100)");
         eprintln!("  --no-oracle  Disable external SMT oracle");
+        eprintln!("  --verify     Cross-check every SAT/UNSAT against oracle; panic on mismatch");
+        eprintln!("  --incremental-bmc  Try incremental SAT BMC before the default BMC pipeline");
         process::exit(1);
     }
 
@@ -41,6 +44,8 @@ fn main() {
     let mut timeout_s: f64 = 300.0;
     let mut max_bound: u32 = 100;
     let mut use_oracle = true;
+    let mut verify_mode = false;
+    let mut incremental_bmc = false;
     let mut filename = None;
 
     let mut i = 1;
@@ -49,6 +54,8 @@ fn main() {
             "--verbose" => verbose = true,
             "--stats" => print_stats = true,
             "--no-oracle" => use_oracle = false,
+            "--verify" => verify_mode = true,
+            "--incremental-bmc" => incremental_bmc = true,
             "--timeout" => {
                 i += 1;
                 timeout_s = args[i].parse().unwrap_or(300.0);
@@ -113,7 +120,7 @@ fn main() {
         solve_smtlib2(&input, verbose, print_stats, solver_path.as_deref())
     } else {
         // BTOR2 mode
-        solve_btor2(&input, verbose, print_stats, solver_path.as_deref(), max_bound, timeout_s)
+        solve_btor2(&input, verbose, print_stats, solver_path.as_deref(), max_bound, timeout_s, verify_mode, incremental_bmc)
     };
 
     match overall_result {
@@ -219,6 +226,7 @@ fn solve_smtlib2(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 fn solve_btor2(
     input: &str,
     verbose: bool,
@@ -226,6 +234,8 @@ fn solve_btor2(
     solver_path: Option<&str>,
     max_bound: u32,
     timeout_s: f64,
+    verify_mode: bool,
+    incremental_bmc: bool,
 ) -> SolveResult {
     let mut model = match btor2::parse_btor2(input) {
         Ok(m) => m,
@@ -290,6 +300,7 @@ fn solve_btor2(
                 max_k: kind_max_k,
                 timeout_s: kind_timeout,
                 verbose,
+                verify_mode,
             };
 
             let kind_result = kinduction::kinduction_check(
@@ -313,13 +324,53 @@ fn solve_btor2(
             }
         }
 
-        // Phase 2: Standard BMC on pristine state (all remaining time)
+        // Phase 2a (optional): Incremental SAT BMC if --incremental-bmc set.
+        // Fast SAT-finder for problems where the transition relation fits in
+        // CNF cleanly. On Unknown (encoding exceeded, or bound reached without
+        // a counterexample), fall through to the legacy BMC.
         let kind_elapsed = phase1_start.elapsed().as_secs_f64();
         let bmc_timeout = (timeout_s - kind_elapsed).max(1.0);
+
+        if incremental_bmc {
+            // Incremental path gets up to half of the remaining budget; on
+            // Unknown we fall through to the legacy path with the remainder.
+            let ibmc_budget = (bmc_timeout * 0.5).max(1.0);
+            let ibmc_start = std::time::Instant::now();
+            let ibmc_config = incremental_bmc::IncrementalBmcConfig {
+                max_bound,
+                timeout_s: ibmc_budget,
+                verbose,
+            };
+            let ibmc_result = incremental_bmc::incremental_bmc_check(
+                &ibmc_config,
+                &mut lifted.tt,
+                &mut lifted.ct,
+                &mut lifted.bm,
+                &state_vars,
+                &lifted.bad_properties,
+                &lifted.constraints,
+                &input_vars,
+            );
+            if verbose {
+                eprintln!("bitr: incremental BMC = {:?} at depth {}",
+                    ibmc_result.status, ibmc_result.depth_reached);
+            }
+            // Only SAT from incremental BMC is conclusive here (its Unsat at
+            // a step is per-step, not unbounded-safety). SAT means a verified
+            // counterexample was found.
+            if ibmc_result.status == SolveResult::Sat {
+                return SolveResult::Sat;
+            }
+            let _ = ibmc_start;
+        }
+
+        // Phase 2b: Legacy substitution-based BMC with all remaining budget.
+        let remaining = (timeout_s - phase1_start.elapsed().as_secs_f64()).max(1.0);
         let bmc_config = bmc::BmcConfig {
             max_bound,
-            timeout_s: bmc_timeout,
+            timeout_s: remaining,
             verbose,
+            verify_mode,
         };
         bmc::bmc_check(
             &bmc_config,

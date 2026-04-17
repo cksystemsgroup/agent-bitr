@@ -1039,8 +1039,38 @@ impl<'a> SolverContext<'a> {
         self.mgr.false_terminal()
     }
 
+    /// Extract a witness and verify it satisfies `verify_term` against `target`.
+    ///
+    /// Returns `Some(witness)` only if evaluating `verify_term` under the extracted
+    /// assignment produces a value in `target`. Returns `None` if no valid assignment
+    /// is found (heuristic search exhausted, or produced a value outside `target`).
+    ///
+    /// This is the soundness-preserving counterpart to [`extract_witness`]: a `None`
+    /// result means the caller cannot confidently claim SAT and should either try
+    /// an alternative solver (bitblaster, oracle) or downgrade to `Unknown`.
+    pub fn extract_witness_verified(
+        &mut self,
+        id: BvddId,
+        target: ValueSet,
+        verify_term: crate::types::TermId,
+    ) -> Option<HashMap<u32, u64>> {
+        let witness = self.extract_witness(id, target);
+        let width = self.tt.get(verify_term).width;
+        let val = self.tt.eval(verify_term, &witness)?;
+        let check = mask_for_check(val, width);
+        if target.contains(check) {
+            Some(witness)
+        } else {
+            None
+        }
+    }
+
     /// Extract a witness (variable→value map) from a SAT result.
     /// Walks the solved BVDD and evaluates the term to find assignments.
+    ///
+    /// **Caution**: this returns a best-effort assignment without verifying it
+    /// satisfies the original target. Use [`extract_witness_verified`] when
+    /// soundness matters (e.g., before returning `SolveResult::Sat` to a caller).
     pub fn extract_witness(&mut self, id: BvddId, target: ValueSet) -> HashMap<u32, u64> {
         let mut witness = HashMap::new();
 
@@ -1371,5 +1401,68 @@ mod tests {
         assert_eq!(vars.len(), 2);
         assert!(vars.contains(&(0, 8)));
         assert!(vars.contains(&(1, 4)));
+    }
+
+    /// A2 soundness test: extract_witness_verified accepts a valid SAT witness.
+    /// Term: x + 1 (width 4). Target: {5}. Witness must exist (x=4).
+    #[test]
+    fn test_extract_witness_verified_accepts_valid() {
+        let mut tt = TermTable::new();
+        let mut ct = ConstraintTable::new();
+        let mut bm = BvcManager::new();
+        let mut mgr = BvddManager::new();
+
+        let x = tt.make_var(0, 4);
+        let c1 = tt.make_const(1, 4);
+        let add = tt.make_app(OpKind::Add, vec![x, c1], 4);
+        let bvc = bm.alloc(4, vec![BvcEntry {
+            term: add,
+            constraint: ct.true_id(),
+        }]);
+        let terminal = mgr.make_terminal(bvc, true, false);
+
+        let mut ctx = make_ctx(&mut tt, &mut ct, &mut bm, &mut mgr);
+        let target = ValueSet::singleton(5);
+        let result_bvdd = ctx.solve(terminal, target);
+
+        // If solve returns Sat, the verified-witness path must also succeed.
+        if ctx.get_result(result_bvdd) == SolveResult::Sat {
+            let verified = ctx.extract_witness_verified(result_bvdd, target, add);
+            assert!(verified.is_some(),
+                "valid SAT must produce a verifiable witness");
+            let w = verified.unwrap();
+            let val = ctx.tt.eval(add, &w).expect("witness evaluates");
+            assert_eq!(val & 0xf, 5, "witness must satisfy x + 1 == 5");
+        }
+    }
+
+    /// A2 soundness test: extract_witness_verified rejects when heuristic returns
+    /// an assignment that evaluates outside target.
+    ///
+    /// Term: constant 42 (width 8). Target: singleton(5). Witness heuristic will
+    /// not find a satisfying assignment (there are no vars; the constant 42 ≠ 5).
+    /// The verified path must return None.
+    #[test]
+    fn test_extract_witness_verified_rejects_const_mismatch() {
+        let mut tt = TermTable::new();
+        let mut ct = ConstraintTable::new();
+        let mut bm = BvcManager::new();
+        let mut mgr = BvddManager::new();
+
+        let c42 = tt.make_const(42, 8);
+        let bvc = bm.alloc(8, vec![BvcEntry {
+            term: c42,
+            constraint: ct.true_id(),
+        }]);
+        let terminal = mgr.make_terminal(bvc, true, true);
+
+        let mut ctx = make_ctx(&mut tt, &mut ct, &mut bm, &mut mgr);
+        let target = ValueSet::singleton(5);
+
+        // Even if BVDD reports something, the verified-witness path must reject
+        // because 42 ∉ {5}.
+        let verified = ctx.extract_witness_verified(terminal, target, c42);
+        assert!(verified.is_none(),
+            "witness verification must reject const≠target");
     }
 }

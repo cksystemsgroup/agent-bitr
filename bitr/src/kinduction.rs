@@ -26,6 +26,10 @@ pub struct KInductionConfig {
     pub max_k: u32,
     pub timeout_s: f64,
     pub verbose: bool,
+    /// When true and an oracle is available, cross-check each SAT/UNSAT answer
+    /// (base case and inductive step) against the external SMT solver and
+    /// panic on disagreement. Dev/CI only.
+    pub verify_mode: bool,
 }
 
 /// Run k-induction check.
@@ -97,16 +101,33 @@ pub fn kinduction_check(
         set
     };
 
-    // Detect inputs used as ITE conditions (likely reset signals) — same as BMC
+    // Detect inputs used as ITE conditions (likely reset signals) — same as BMC,
+    // with the same A5 soundness fence: disqualify any candidate that also
+    // appears in a data position of next-state, bad, or constraints.
     let inputs_as_ite_cond: std::collections::HashSet<u32> = {
-        let mut set = std::collections::HashSet::new();
+        let mut candidates = std::collections::HashSet::new();
         for sv in states {
             if let Some(next_bvc) = sv.next_bvc {
                 let term = bm.get(next_bvc).entries[0].term;
-                crate::bmc::collect_ite_cond_inputs(tt, term, &inputs_in_next, &mut set);
+                crate::bmc::collect_ite_cond_inputs(tt, term, &inputs_in_next, &mut candidates);
             }
         }
-        set
+        let mut disqualified = std::collections::HashSet::new();
+        for sv in states {
+            if let Some(next_bvc) = sv.next_bvc {
+                let term = bm.get(next_bvc).entries[0].term;
+                crate::bmc::collect_non_reset_uses(tt, term, &candidates, &mut disqualified);
+            }
+        }
+        for &bad_bvc in bad_properties {
+            let term = bm.get(bad_bvc).entries[0].term;
+            crate::bmc::collect_non_reset_uses(tt, term, &candidates, &mut disqualified);
+        }
+        for &c_bvc in constraints {
+            let term = bm.get(c_bvc).entries[0].term;
+            crate::bmc::collect_non_reset_uses(tt, term, &candidates, &mut disqualified);
+        }
+        candidates.into_iter().filter(|v| !disqualified.contains(v)).collect()
     };
 
     for k in 0..=config.max_k {
@@ -143,6 +164,17 @@ pub fn kinduction_check(
             if result == SolveResult::Sat {
                 if config.verbose {
                     eprintln!("bitr: counterexample found at step {} (base case)", k);
+                }
+                if config.verify_mode {
+                    if let Some(ref mut oracle) = smt_oracle {
+                        let term = bm.get(resolved).entries[0].term;
+                        let width = bm.get(resolved).width;
+                        crate::bmc::verify_against_oracle(
+                            tt, term, width, ValueSet::singleton(1),
+                            SolveResult::Sat, oracle,
+                            &format!("kind base k={}", k),
+                        );
+                    }
                 }
                 return SolveResult::Sat;
             }
@@ -355,7 +387,18 @@ fn solve_bvc(
             });
         }
         let result_bvdd = ctx.solve(terminal, ValueSet::singleton(1));
-        ctx.get_result(result_bvdd)
+        let raw = ctx.get_result(result_bvdd);
+        // A2: verify SAT witness. If unverifiable, downgrade so tier 2/3 reattempt.
+        if raw == SolveResult::Sat {
+            let target_vs = ValueSet::singleton(1);
+            if ctx.extract_witness_verified(result_bvdd, target_vs, term).is_none() {
+                SolveResult::Unknown
+            } else {
+                SolveResult::Sat
+            }
+        } else {
+            raw
+        }
     } else {
         SolveResult::Unknown
     };
@@ -368,11 +411,15 @@ fn solve_bvc(
         let (bb_result, bb_witness) = bb.solve(term, width, &target);
         match bb_result {
             SolveResult::Sat => {
-                if let Some(val) = tt.eval(term, &bb_witness) {
-                    if target.contains((val & 1) as u8) {
-                        result = SolveResult::Sat;
-                    }
+                // A2: require witness verification for SAT. Silent-fail previously
+                // could keep `Unknown` when witness was produced but invalid — now
+                // the downgrade is explicit.
+                let verified = tt.eval(term, &bb_witness)
+                    .is_some_and(|val| target.contains((val & 1) as u8));
+                if verified {
+                    result = SolveResult::Sat;
                 }
+                // else: remain Unknown — fall through to oracle tier
             }
             SolveResult::Unsat => result = SolveResult::Unsat,
             SolveResult::Unknown => {}
