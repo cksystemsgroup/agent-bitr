@@ -500,7 +500,8 @@ mod tests {
         let sl = tt.make_slice(x, 5, 2); // bits [5:2] → 4-bit result
 
         let mut assign = HashMap::new();
-        assign.insert(0, 0b11_1010_11u64); // bits[5:2] = 1010 = 10
+        // Binary 11101011 = 0xEB. bits[5:2] = 1010 = 10.
+        assign.insert(0, 0b1110_1011_u64);
         assert_eq!(tt.eval(sl, &assign), Some(0b1010));
     }
 

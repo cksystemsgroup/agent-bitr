@@ -782,7 +782,8 @@ mod tests {
         let prog = CompiledProgram::compile(&tt, sl);
         let sx = prog.var_slot(0).unwrap() as usize;
         let mut vars = vec![0u64; 1];
-        vars[sx] = 0b11_1010_11; // bits[5:2] = 1010
+        // Binary 11101011 = 0xEB. bits[5:2] = 1010 = 10.
+        vars[sx] = 0b1110_1011;
         assert_eq!(prog.eval(&vars), 0b1010);
     }
 

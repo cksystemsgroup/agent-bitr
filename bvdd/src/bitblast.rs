@@ -894,8 +894,10 @@ impl<'a> BitBlaster<'a> {
         let num_clauses = clauses.len();
 
         // Configure solver — use generous SAT timeout (process-level timeout handles hangs)
-        let mut config = splr::Config::default();
-        config.c_timeout = 300.0;
+        let config = splr::Config {
+            c_timeout: 300.0,
+            ..Default::default()
+        };
 
         let desc = splr::types::CNFDescription {
             num_of_variables: num_vars,
