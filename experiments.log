@@ -288,3 +288,24 @@
       independent of k-induction budget.
 
   Sound baseline at 60s: 29/155 = current competitive number.
+
+2026-04-18 | b71796a | incremental BMC as default, --legacy-bmc for opt-in | 29/155 | 6670s (1h51m)
+  Test of option (c) from the 300s entry above. Default pipeline now:
+  k-induction (25% budget) -> incremental BMC (75%, no legacy fallback).
+  Previously: k-ind 25% -> ibmc 37.5% -> legacy 37.5%.
+
+  60s sweep (results/bv_60s_default_ibmc.csv):
+  - 9 sat + 20 unsat = 29/155 (identical headline to bv_postfix.csv).
+  - Set diff: SAME 29 benchmarks. Zero gained, zero lost.
+
+  Implication: in the prior split-budget run, legacy BMC contributed nothing
+  over incremental. Doubling incremental's budget also unlocked no new
+  solves. The remaining 126 failures are NOT budget-bound — they are
+  algorithmic. More time will not move the number.
+
+  Next levers (not budget):
+  - Phase D: inductive generalization (counterexample-to-induction cube
+    refinement).
+  - Phase C: CNF peepholes + hash-cons of ITE selectors in bitblast.rs.
+  - Cooperative cancellation in substitute_states (unblocks meaningful
+    --legacy-bmc comparison, still useful as oracle).
