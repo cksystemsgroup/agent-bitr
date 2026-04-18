@@ -258,3 +258,33 @@
   - Phase D: inductive generalization to unlock kind_only timeouts.
   - Investigate shift_register_top_w32_d64_e0 specifically — either our lifter
     is missing something or incremental BMC is slower than the legacy path.
+
+2026-04-18 | 300s HWMCC BV sweep | counterintuitive regression vs 60s
+  Same soundness-fixed binary at 300s/bench instead of 60s (run_sweep.py
+  with --incremental-bmc, 7h27m total; results/bv_300s_postfix.csv).
+
+  Result: 27/155 solved (7 sat + 20 unsat). LOWER than 60s (29/155; 9 sat +
+  20 unsat).
+
+  Transition 60s → 300s:
+  - 7 sat → sat, 22 unsat → unsat (core preserved)
+  - 2 sat → timeout at 300s: marlann_compute_cp_fail2-p1, vis_arrays_vsa16a_p6
+    (solver found SAT within 60s but NOT within 300s)
+  - 9 timeout → unknown (graceful exits)
+  - 17 unknown → timeout (ran past 60s then hit 305s wrapper-kill)
+
+  Hypothesis: constraint accumulation (def492c) + longer k-induction budget
+  let k-induction build bigger BVCs before BMC starts. The larger term table
+  slows substitute_states quadratically, so BMC at step k is MORE expensive
+  at 300s than at 60s. Effective BMC time is SMALLER at the longer budget.
+
+  Practical consequence: 60s is currently a better operating point than 300s.
+  Fixing this requires one of:
+  (a) k-induction bail on term-table growth (we have tt.len() > 500k today,
+      should be lower or accumulation-budgeted for k-induction specifically).
+  (b) Cooperative cancellation inside substitute_states so inner loops
+      respect outer --timeout.
+  (c) Incremental BMC as the first-class default (no legacy-BMC fallback)
+      independent of k-induction budget.
+
+  Sound baseline at 60s: 29/155 = current competitive number.
